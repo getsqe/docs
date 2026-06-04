@@ -1,0 +1,5 @@
+# mdBook build output
+book/
+
+# Rust / cargo build artifacts
+target/
