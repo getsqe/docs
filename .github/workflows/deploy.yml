@@ -3,6 +3,8 @@ name: Deploy docs to GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 # Allow the workflow to publish to GitHub Pages.
@@ -11,9 +13,9 @@ permissions:
   pages: write
   id-token: write
 
-# Allow only one concurrent deployment; let an in-progress run finish.
+# Serialize per ref: main pushes queue; PR runs stay isolated, never block deploy.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -21,6 +23,7 @@ env:
   MDBOOK_MERMAID_VERSION: "0.17.0"
 
 jobs:
+  # Runs on every push AND every PR — this is the merge gate.
   build:
     runs-on: ubuntu-latest
     steps:
@@ -36,15 +39,22 @@ jobs:
       - name: Build mdBook
         run: mdbook build
 
+      - name: Leak-scan built book (blocking gate)
+        run: bash scripts/leak-scan.sh book '*.html'
+
       - name: Add CNAME for custom domain
+        if: github.event_name != 'pull_request'
         run: cp public/CNAME book/CNAME
 
       - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
           path: book
 
+  # Deploy only on push to main / manual dispatch — never on PRs.
   deploy:
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:
