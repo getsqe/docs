@@ -1,6 +1,6 @@
 # Quack RPC datatype matrix
 
-How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types line up for the Quack RPC path. Status reflects what works through a real `duckdb 1.5.3` CLI session (`SELECT ... FROM quack_query('quack:localhost:9494', ...)`) against a current `sqe-server` build.
+How DuckDB, Arrow/DataFusion, SQE's `LogicalTypeId`, and Iceberg primitive types line up for the Quack RPC path. Status reflects what works through a real `duckdb 1.5.3` CLI session (`SELECT ... FROM quack_query('quack:localhost:9494', ...)`) against `sqe-server` on `a feature branch` and later.
 
 ## Scalar types
 

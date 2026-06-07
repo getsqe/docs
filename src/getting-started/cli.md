@@ -58,7 +58,7 @@ FROM read_parquet(
     's3://bucket/path/*.parquet',
     access_key  => 'AKIA...',
     secret_key  => '...',
-    region      => 'us-east-1'
+    region      => 'eu-example-1'
 );
 ```
 

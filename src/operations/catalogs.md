@@ -87,7 +87,7 @@ the coordinator exits cleanly.
 CREATE SECRET aws_dev (TYPE aws,
   ACCESS_KEY_ID = 'AKIA...',
   SECRET_ACCESS_KEY = 'wJalrXUt...',
-  REGION = 'us-east-1');
+  REGION = 'eu-example-1');
 
 ATTACH '' AS glue_dev
   (TYPE glue, WAREHOUSE 's3://my-warehouse/', SECRET aws_dev);

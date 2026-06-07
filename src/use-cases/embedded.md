@@ -59,14 +59,14 @@ Requires the `aws` cargo feature (default-on).
 # AWS Glue Data Catalog (warehouse is an s3:// prefix)
 AWS_PROFILE=analytics sqe-cli --embedded \
     --catalog-backend glue \
-    --catalog-warehouse s3://my-bucket/warehouse --region us-east-1 \
+    --catalog-warehouse s3://my-bucket/warehouse --region eu-example-1 \
     -e "SELECT * FROM glue.analytics.events LIMIT 10"
 
 # AWS S3 Tables (warehouse is the table-bucket ARN)
 AWS_PROFILE=analytics sqe-cli --embedded \
     --catalog-backend s3tables \
-    --catalog-warehouse arn:aws:s3tables:us-east-1:ACCOUNT:bucket/NAME \
-    --region us-east-1 \
+    --catalog-warehouse arn:aws:s3tables:eu-example-1:ACCOUNT:bucket/NAME \
+    --region eu-example-1 \
     -e "SHOW SCHEMAS"
 ```
 

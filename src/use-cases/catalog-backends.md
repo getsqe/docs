@@ -30,7 +30,7 @@ the standard provider chain (`AWS_PROFILE`, instance profile, SSO).
 ```toml
 [catalog.backend]
 type      = "glue"
-region    = "us-east-1"
+region    = "eu-example-1"
 warehouse = "s3://my-bucket/warehouse"
 ```
 
@@ -41,7 +41,7 @@ set -a; source .env; set +a   # AWS_PROFILE, AWS_REGION, SQE_TEST_GLUE_WAREHOUSE
 cargo test -p sqe-catalog --features glue --test backends_integration -- --ignored glue::
 ```
 
-Run live this round against a real AWS deployment:
+Run live this round against `eu-example-1` (account `ACCOUNT_ID`):
 
 ```text
 test glue::live_glue_namespace_round_trip ... ok
@@ -57,7 +57,7 @@ with the `aws-sigv4` feature).
 ```toml
 [catalog.backend]
 type             = "s3tables"
-table_bucket_arn = "arn:aws:s3tables:us-east-1:ACCOUNT:bucket/NAME"
+table_bucket_arn = "arn:aws:s3tables:eu-example-1:ACCOUNT:bucket/NAME"
 ```
 
 Verify (live AWS):
