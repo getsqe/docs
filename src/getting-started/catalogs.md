@@ -21,7 +21,8 @@ just a warehouse path to walk.
 | Hadoop   | `hadoop` | `warehouse` | | `hadoop` | (SQE-native) |
 
 All six are smoke-tested in CI. Two of them, Glue and S3 Tables,
-are additionally verified live against real AWS deployments.
+are verified live against production AWS deployments (account
+`ACCOUNT_ID`, eu-example-1 and eu-example-2).
 
 ## Multiple catalogs in one coordinator
 
@@ -52,14 +53,14 @@ type = "rest"
 catalog_url = ""
 [catalogs.aws_glue.backend]
 type = "glue"
-region = "us-east-1"
+region = "eu-example-1"
 warehouse = "s3://my-bucket/wh"
 
 [catalogs.aws_s3tables]
 catalog_url = ""
 [catalogs.aws_s3tables.backend]
 type = "s3tables"
-table_bucket_arn = "arn:aws:s3tables:us-east-1:ACCOUNT:bucket/my-bucket"
+table_bucket_arn = "arn:aws:s3tables:eu-example-2:ACCOUNT_ID:bucket/my-bucket"
 
 [catalogs.legacy_hms]
 catalog_url = ""
@@ -134,7 +135,7 @@ type = "anonymous"
 [catalogs.aws_glue]
 [catalogs.aws_glue.backend]
 type = "glue"
-region = "us-east-1"
+region = "eu-example-1"
 warehouse = "s3://wh/"
 [catalogs.aws_glue.auth]
 type = "aws"
@@ -221,7 +222,7 @@ against a docker-compose overlay during CI.
 ```toml
 [catalog.backend]
 type      = "glue"
-region    = "us-east-1"
+region    = "eu-example-1"
 warehouse = "s3://my-bucket/warehouse"
 # endpoint = "http://localhost:4566"   # optional, e.g. LocalStack
 ```
@@ -239,8 +240,8 @@ tables.
 
 Pulls in `aws-sdk-glue` + `aws-config` (~50-80 MB).
 
-**Live verification (2026-05-05)** against AWS Glue
-(database `iceberg_demo_analytics`):
+**Live verification (2026-05-05)** against AWS Glue in eu-example-1
+(account `ACCOUNT_ID`, database `iceberg_demo_analytics`):
 
 ```
 sqe> SHOW SCHEMAS;
@@ -264,9 +265,9 @@ sqe> SELECT region, event_type, COUNT(*) AS n
 | region     | event_type | n     |
 +------------+------------+-------+
 | ap-south   | login      | 50524 |
-| eu-north   | login      | 50424 |
-| eu-north   | click      | 50391 |
-| eu-north   | view       | 50251 |
+| eu-example-1 | login      | 50424 |
+| eu-example-1 | click      | 50391 |
+| eu-example-1 | view       | 50251 |
 | us-west    | click      | 50155 |
 +------------+------------+-------+
 ```
@@ -284,7 +285,7 @@ by ARN.
 ```toml
 [catalog.backend]
 type             = "s3tables"
-table_bucket_arn = "arn:aws:s3tables:us-east-1:ACCOUNT:bucket/my-bucket"
+table_bucket_arn = "arn:aws:s3tables:eu-example-2:ACCOUNT_ID:bucket/my-bucket"
 # endpoint_url   = "http://localhost:4566"   # optional, custom endpoint
 ```
 
@@ -296,7 +297,7 @@ Pulls in `aws-sdk-s3tables`. Shares the AWS SDK runtime that
 AWS-enabled build is small (~5 MB).
 
 **Live verification (2026-05-05)** against
-`arn:aws:s3tables:us-east-1:ACCOUNT:bucket/testtablebucket`:
+`arn:aws:s3tables:eu-example-2:ACCOUNT_ID:bucket/testtablebucket`:
 
 ```
 sqe> SHOW SCHEMAS;

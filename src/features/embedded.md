@@ -1,22 +1,30 @@
-# Embedded and single-node CLI
+# Embedded mode
 
-`sqe-cli` can run the engine in-process, with no server and no network. The
-same DataFusion engine, the same Iceberg reader, the same SQL: it just runs
-inside the CLI process. This is the fastest way to query a warehouse from a
-laptop, a CI job, or a script.
+SQE can run the full query engine in-process, with no server and no network.
+`sqe-cli` in embedded mode starts DataFusion, the Iceberg reader, and the same
+SQL planner locally — inside the CLI process. This is the fastest path for
+querying a warehouse from a laptop, a CI job, or a script.
 
-Three storage modes:
+Four warehouse modes:
 
-- `--memory`: an in-memory DataFusion catalog. Nothing is persisted. Good for
-  ad-hoc SQL and testing functions.
-- `--warehouse PATH`: a filesystem Iceberg warehouse with **no catalog
-  service**. SQE walks the path for `metadata.json` and treats the prefix as
-  the catalog. This is the "Iceberg without a catalog" case.
-- `--catalog NAME=PATH`: one or more named Iceberg warehouses, addressable as
-  `NAME.namespace.table`.
+- **In-memory** (`--memory`): a transient DataFusion catalog. Nothing is
+  persisted. Good for ad-hoc SQL and testing SQL functions.
+- **Filesystem warehouse** (`--warehouse PATH`): an Iceberg warehouse on local
+  disk or object storage with **no catalog service**. SQE walks the path for
+  `metadata.json` files and treats the prefix as the catalog. The "Iceberg
+  without a catalog" case.
+- **Persistent SQLite catalog** (`--catalog-backend sqlite`): a durable
+  single-node catalog backed by a local SQLite file. Survives restarts.
+- **Cloud catalogs embedded**: Glue and S3 Tables can be attached directly,
+  with no coordinator, using the standard AWS credential chain.
 
-A persistent SQLite catalog (the JDBC backend pointed at a local file) is also
-available for a durable single-node catalog.
+See the quickstarts:
+
+- [Embedded: query local and remote files](../quickstart/embedded-files.md)
+- [Embedded: persistent local catalog (SQLite)](../quickstart/embedded-sqlite-catalog.md)
+- [Embedded: attach multiple catalogs](../quickstart/attach-catalogs.md)
+
+---
 
 ## In-memory
 
@@ -59,14 +67,14 @@ Requires the `aws` cargo feature (default-on).
 # AWS Glue Data Catalog (warehouse is an s3:// prefix)
 AWS_PROFILE=analytics sqe-cli --embedded \
     --catalog-backend glue \
-    --catalog-warehouse s3://my-bucket/warehouse --region us-east-1 \
+    --catalog-warehouse s3://my-bucket/warehouse --region eu-example-1 \
     -e "SELECT * FROM glue.analytics.events LIMIT 10"
 
 # AWS S3 Tables (warehouse is the table-bucket ARN)
 AWS_PROFILE=analytics sqe-cli --embedded \
     --catalog-backend s3tables \
-    --catalog-warehouse arn:aws:s3tables:us-east-1:ACCOUNT:bucket/NAME \
-    --region us-east-1 \
+    --catalog-warehouse arn:aws:s3tables:eu-example-1:ACCOUNT:bucket/NAME \
+    --region eu-example-1 \
     -e "SHOW SCHEMAS"
 ```
 

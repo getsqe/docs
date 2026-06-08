@@ -59,7 +59,7 @@ When inline `access_key` / `secret_key` are absent, SQE delegates to the AWS SDK
 # config.toml
 [storage]
 type   = "s3"
-region = "us-east-1"
+region = "eu-example-2"
 # No access_key / secret_key here -> provider chain.
 ```
 
@@ -74,8 +74,8 @@ SELECT * FROM read_parquet(
     's3://bucket/path/*.parquet',
     access_key => 'AKIA...',
     secret_key => '...',
-    endpoint   => 'https://s3.us-east-1.aws-endpoint',
-    region     => 'us-east-1'
+    endpoint   => 'https://s3.eu-example-2.aws-endpoint',
+    region     => 'eu-example-2'
 );
 ```
 

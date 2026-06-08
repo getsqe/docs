@@ -70,13 +70,13 @@ default_table_format_version = 2 # Iceberg table format version (2 or 3)
 
 # [catalog.backend]
 # type   = "glue"
-# region = "us-east-1"
+# region = "eu-example-1"
 # warehouse = "s3://my-bucket/warehouse"
 # # endpoint = "http://localhost:4566"   # optional, e.g. LocalStack
 
 # [catalog.backend]
 # type             = "s3tables"
-# table_bucket_arn = "arn:aws:s3tables:us-east-1:ACCOUNT:bucket/my-bucket"
+# table_bucket_arn = "arn:aws:s3tables:eu-example-2:ACCOUNT_ID:bucket/my-bucket"
 # # endpoint_url   = "http://localhost:4566"
 
 # [catalog.backend]
