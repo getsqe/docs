@@ -23,8 +23,9 @@ set -euo pipefail
 DIR="${1:?usage: leak-scan.sh <dir> [glob]}"
 GLOB="${2:-*.md}"
 
-# Case-insensitive leak regex (shared spec).
-REGEX='[0-9]{12}|chore/|feat/|crates/sqe-|eu-(central|west)|amazonaws|MR !'
+# Case-insensitive leak regex (shared spec). jacobadmin/jacobbuilder matched
+# specifically (NOT bare "jacob") to avoid false hits on an author byline.
+REGEX='[0-9]{12}|chore/|feat/|crates/sqe-|eu-(central|west)|amazonaws|MR !|sbp\.gitlab|gitlab\.schubergphilis|vpf-data-ai|jacobadmin|jacobbuilder'
 
 # Collect hits. grep exits 1 when it finds nothing, which under `pipefail`
 # would abort the script on the (desired) clean case, so guard with `|| true`.
