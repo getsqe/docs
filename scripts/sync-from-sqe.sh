@@ -36,6 +36,14 @@ cp "$SRC_BOOK/book.toml" "$REPO_ROOT/book.toml"
 # src/ tree (mirror with delete so removed files do not linger)
 rsync -a --delete "$SRC_BOOK/src/" "$REPO_ROOT/src/"
 
+# Overlay the curated OVERVIEW.md onto each per-quickstart book page (single
+# source of truth). Index + Quack reference pages are left as authored.
+echo "→ overlaying quickstart OVERVIEW pages"
+for ov in "$SQE_DIR"/quickstart/*/OVERVIEW.md; do
+  n="$(basename "$(dirname "$ov")")"
+  [[ -f "$REPO_ROOT/src/quickstart/$n.md" ]] && cp "$ov" "$REPO_ROOT/src/quickstart/$n.md"
+done
+
 # mermaid assets at repo root
 cp "$SRC_BOOK/mermaid.min.js" "$REPO_ROOT/mermaid.min.js"
 cp "$SRC_BOOK/mermaid-init.js" "$REPO_ROOT/mermaid-init.js"

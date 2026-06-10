@@ -1,57 +1,114 @@
----
-slug: observability
-title: "Observability: metrics + Grafana"
-description: "Scrape SQE's Prometheus metrics with VictoriaMetrics and visualise them in Grafana. A minimal queryable SQE (Nessie catalog) generates real metrics: queries, cache, sessions, scan pruning, coordinator memory."
----
-
 # Observability: metrics + Grafana
 
-SQE exposes Prometheus metrics on a configurable `prometheus_port`. This
-quickstart scrapes them with **VictoriaMetrics** and renders them in **Grafana**,
-so you can watch query rate, cache hit/miss, active sessions, scan pruning, and
-coordinator memory while running queries.
+## Goal
 
-A minimal queryable SQE (Nessie catalog + RustFS, anonymous auth) generates real
-metrics; the focus here is the monitoring pipeline.
+SQE exposes Prometheus metrics on its `metrics.prometheus_port` (`/metrics`, port 9090
+in this quickstart). This stack scrapes them with **VictoriaMetrics** and renders them in
+**Grafana**, giving you a live view of query rate, cache hit/miss, active sessions, scan
+pruning, and coordinator memory while queries run.
 
-## How it works
+A minimal queryable SQE (Nessie catalog + RustFS, anonymous auth) sits underneath just to
+generate real metrics — the focus here is the monitoring pipeline, not the data layer.
 
-- **SQE** serves Prometheus text metrics at `/metrics` on its `prometheus_port`.
-  The coordinator binds the metrics port on all interfaces so VictoriaMetrics
-  can reach it in-network.
-- **VictoriaMetrics** scrapes the SQE metrics endpoint every 5 seconds using a
-  scrape config that names the target `sqe-coordinator`.
-- **Grafana** is provisioned with VictoriaMetrics as the default datasource and
-  an **SQE Overview** dashboard. Open it at `http://localhost:13000` (admin /
-  admin) after the stack starts.
-- `run.sh` starts the stack, runs `queries.sql` a few times to generate metrics,
-  waits for a scrape, then queries the VictoriaMetrics API to assert SQE's
-  counters are present.
+## Components
 
-A selection of the metrics SQE exposes: `sqe_rows_returned_total`,
-`sqe_active_sessions`, `sqe_cache_hits_total` / `sqe_cache_misses_total`,
-`sqe_files_pruned_minmax_total`, `sqe_coordinator_memory_used_bytes`,
-`sqe_s3_requests_total` / `sqe_s3_bytes_read_total`.
+| Service | Role |
+|---|---|
+| `sqe` | Coordinator: Flight SQL on 50051, Prometheus `/metrics` on 9090. |
+| `nessie` | Iceberg REST catalog (auth-less). |
+| `rustfs` + `bucket-init` | S3-compatible warehouse storage. |
+| `victoriametrics` | Scrapes `sqe:9090/metrics` every 5 s. |
+| `grafana` | Provisioned VictoriaMetrics datasource + "SQE Overview" dashboard. |
 
-## What it demonstrates
+## Configuration
 
-- The full Prometheus → VictoriaMetrics → Grafana scrape pipeline against a live
-  SQE instance.
-- SQE's `prometheus_port` config and the metrics it exposes out of the box.
-- The provisioned **SQE Overview** Grafana dashboard.
-- Asserted via the VictoriaMetrics query API: the `up{job="sqe-coordinator"}`
-  target is 1 and SQE counters are populated.
+### Backend (sqe.toml)
 
-**Status:** validated (2026-06-07).
+```toml
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+mode = "hybrid"
 
-## Run it
+[worker]
+memory_limit = "4GB"
 
-Full config, `docker compose`, dashboard, and captured output are in the repo:
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
 
-**→ [quickstart/observability/](https://github.com/schubergphilis/sqe/tree/main/quickstart/observability/)**
+[catalogs.nessie]
+polaris_url = "http://nessie:19120/iceberg"
+warehouse = "warehouse"
 
-```bash
-cd quickstart/observability
-cp .env.example .env
-./run.sh
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "eu-example-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+
+[metrics]
+prometheus_port = 9090
+```
+
+### SQL (queries.sql)
+
+```sql
+CREATE SCHEMA IF NOT EXISTS nessie.demo;
+
+DROP TABLE IF EXISTS nessie.demo.events;
+CREATE TABLE nessie.demo.events (
+    id     BIGINT,
+    kind   VARCHAR,
+    amount DOUBLE
+);
+
+INSERT INTO nessie.demo.events VALUES
+    (1, 'click',    1.50),
+    (2, 'purchase', 42.00),
+    (3, 'click',    0.75),
+    (4, 'purchase', 13.25);
+
+SELECT kind, COUNT(*) AS n, ROUND(SUM(amount), 2) AS total
+FROM nessie.demo.events
+GROUP BY kind
+ORDER BY total DESC;
+```
+
+## The test
+
+`run.sh` brings the full stack up (`docker compose up -d --wait`), then runs `queries.sql`
+three times via `sqe-cli` to populate real metric counters. It polls the VictoriaMetrics
+API until `sqe_rows_returned_total` appears (up to ~45 s, 5 s scrape interval), then
+queries each key metric via the `/api/v1/query` endpoint and asserts the scrape target is
+`up{job="sqe-coordinator"} = 1`. Finally it curls `sqe:9090/metrics` directly and
+captures a sample of raw `sqe_*` counters to `OUTPUT.md`. Open Grafana at
+`http://localhost:13000` (admin / admin) for the provisioned **SQE Overview** dashboard.
+Tear down with `./run.sh --down`.
+
+## Output
+
+```
+# Captured output
+
+_Generated by `./run.sh` on 2026-06-07T09:12:02Z._
+
+## VictoriaMetrics is scraping the SQE coordinator
+scrape target up{job="sqe-coordinator"} = 1
+sqe_rows_returned_total                    = 9
+sqe_active_sessions                        = 0
+sqe_cache_misses_total                     = 0
+sqe_coordinator_memory_used_bytes          = 0
+
+## A sample of SQE's raw /metrics (sqe_*)
+sqe_active_sessions 0
+sqe_cache_hits_total 0
+sqe_cache_misses_total 0
+sqe_coordinator_memory_used_bytes 0
+sqe_files_pruned_minmax_total 0
+sqe_rows_returned_total 27
+sqe_s3_bytes_read_total 0
 ```

@@ -1,50 +1,97 @@
----
-slug: embedded-files
-title: "Embedded: query local and remote files"
-description: "Run SQE's engine in-process with sqe-cli --embedded and query CSV, JSON, and Parquet files directly with read_csv / read_json / read_parquet. No server, no catalog, local files or HTTPS URLs."
----
-
 # Embedded: query local and remote files
 
-SQE's engine runs in-process. `sqe-cli --embedded --memory` starts the query
-engine and the file-reader table-valued functions in a single binary — no
-coordinator, no workers, no network listeners, no catalog. The `read_csv`,
-`read_json`, and `read_parquet` TVFs read files directly, whether they live on
-local disk or behind an HTTPS URL.
+## Goal
 
-This is the fastest way to explore data with SQL. There is no Docker stack to
-bring up; this quickstart just runs the CLI.
+SQE's engine runs in-process. `sqe-cli --embedded --memory` starts DataFusion,
+the Iceberg writers, and the file-reader table-valued functions in a single
+binary: no coordinator, no workers, no network listeners, no catalog.
 
-## How it works
+`read_csv`, `read_json`, and `read_parquet` read files directly, whether they
+live on local disk or behind an HTTPS URL. Nothing persists between runs — the
+`--memory` flag makes the session ephemeral. This is the fastest way to query
+data with SQE SQL: no stack to bring up, no catalog to configure.
 
-- `--embedded` runs the engine in-process. `--memory` disables the persistent
-  catalog — the session is ephemeral and nothing is written to disk.
-- Sample data files (CSV, JSON, Parquet) in the `data/` directory are mounted
-  into the container at runtime.
-- `read_csv`, `read_json`, and `read_parquet` accept a local path, an `https://`
-  URL, or an `s3://` URI — the same object-store layer backs all three.
-- `run.sh` exercises local CSV aggregation, a cross-format JOIN (CSV + Parquet),
-  and a remote HTTPS Parquet read, and captures the output.
+## Components
 
-## What it demonstrates
+| Component | Role |
+|---|---|
+| `sqe-cli` | Embedded engine binary (in-process; no separate server) |
+| `data/` | Three sample files (CSV, JSON, Parquet) — five rows each |
+| Docker (optional) | Container wrapper when no local `sqe-cli` build is available |
 
-- Querying CSV, JSON, and Parquet files with SQL in a single binary, no server.
-- Cross-format joins: `read_csv(...)` and `read_parquet(...)` in one query.
-- Remote file reads over HTTPS: `read_parquet('https://...')` streams the file
-  via range requests.
-- The `--memory` flag: no state survives the process (for persistent local
-  tables, see the [embedded-sqlite-catalog quickstart](./embedded-sqlite-catalog.md)).
+## Configuration
 
-**Status:** validated (2026-06-06).
-
-## Run it
-
-Full sample data, queries, and captured output are in the repo:
-
-**→ [quickstart/embedded-files/](https://github.com/schubergphilis/sqe/tree/main/quickstart/embedded-files/)**
+### CLI
 
 ```bash
-cd quickstart/embedded-files
-cp .env.example .env
-./run.sh
+# Wrapper: run the embedded CLI in the SQE image with ./data mounted read-only
+sqe() { docker run --rm --entrypoint sqe-cli -v "$PWD/data":/data:ro \
+          sqe-quickstart:latest --embedded --memory "$@"; }
+
+# Local CSV — aggregate by kind
+sqe -e "SELECT kind, COUNT(*) AS n, ROUND(SUM(amount),2) AS total
+        FROM read_csv('/data/events.csv') GROUP BY kind ORDER BY total DESC"
+
+# Local JSON — count + sum
+sqe -e "SELECT COUNT(*) AS rows, ROUND(SUM(amount),2) AS total
+        FROM read_json('/data/events.json')"
+
+# Local Parquet — sum by kind
+sqe -e "SELECT kind, ROUND(SUM(amount),2) AS total
+        FROM read_parquet('/data/events.parquet') GROUP BY kind ORDER BY kind"
+
+# Join two files of different formats in one query
+sqe -e "SELECT c.id, c.kind FROM read_csv('/data/events.csv') c
+        JOIN read_parquet('/data/events.parquet') p ON c.id = p.id
+        WHERE c.amount > 10 ORDER BY c.id"
+
+# Remote file over HTTPS
+sqe -e "SELECT COUNT(*) AS rows FROM read_parquet('https://example.com/data.parquet')"
+```
+
+`--memory` runs with no persistent catalog (nothing survives the process).
+`--embedded` without `--memory` attaches a SQLite-backed Iceberg catalog at
+`~/.sqe/warehouse` instead, so `CREATE TABLE` persists. See
+`embedded-sqlite-catalog` for that mode.
+
+## The test
+
+`run.sh` exercises `read_csv`, `read_json`, and `read_parquet` on the local
+sample files in `data/`, runs a cross-format JOIN between CSV and Parquet, and
+queries a remote Parquet file over HTTPS. All output is captured to `OUTPUT.md`.
+The local Parquet path mirrors the `test_read_parquet_local_file` integration
+test. Last validated 2026-06-06.
+
+## Output
+
+```
+## Local CSV (read_csv)
+sqe-cli 0.31.4 embedded engine (1GB memory pool, ephemeral)
++----------+---+-------+
+| kind     | n | total |
++----------+---+-------+
+| purchase | 2 | 55.25 |
+| click    | 2 | 2.25  |
+| refund   | 1 | -5.0  |
++----------+---+-------+
+(3 rows)
+
+## Join two files of different formats in one query
+sqe-cli 0.31.4 embedded engine (1GB memory pool, ephemeral)
+(2 rows)
++----+----------+
+| id | kind     |
++----+----------+
+| 2  | purchase |
+| 4  | purchase |
++----+----------+
+
+## Remote file over HTTPS (read_parquet on a URL)
+sqe-cli 0.31.4 embedded engine (1GB memory pool, ephemeral)
++------+
+| rows |
++------+
+| 1000 |
++------+
+(1 rows)
 ```

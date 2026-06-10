@@ -1,50 +1,84 @@
----
-slug: aws-s3-tables
-title: "AWS S3 Tables (managed Iceberg)"
-description: "Run SQE against AWS S3 Tables, AWS's managed Iceberg service (metadata + storage in one). A CDK stack bootstraps a throwaway table bucket and tears it down; SQE creates the namespace and does a full create/write/read round-trip over the AWS SDK."
----
-
 # AWS S3 Tables (managed Iceberg)
 
-Point SQE at **AWS S3 Tables**, AWS's managed Iceberg product. Unlike Glue
-(metadata only), S3 Tables bundles the catalog and the storage into one service:
-you create a table bucket, and namespaces and tables live inside it. SQE talks
-to it over the AWS SDK with your IAM credentials.
+## Goal
 
-A small CDK stack bootstraps the throwaway table bucket and tears it down at the
-end, so the quickstart leaves nothing behind in your account.
+Point SQE at AWS S3 Tables, AWS's managed Iceberg product. Unlike Glue (metadata only), S3 Tables bundles the catalog _and_ the storage into one service: you create a _table bucket_, and namespaces plus tables live inside it. SQE talks to it over the AWS SDK with your IAM credentials.
 
-## How it works
+A small CDK stack bootstraps the throwaway table bucket and tears it down after the run, so the quickstart leaves nothing behind.
 
-- A **TypeScript CDK stack** creates an S3 Tables table bucket in your AWS
-  account on deploy and removes it on destroy.
-- **SQE** uses the `s3tables` catalog backend, configured with the table bucket
-  ARN. The bucket ARN and your AWS region are injected at runtime by `run.sh`.
-- AWS IAM credentials (via `AWS_PROFILE` or environment variables) authenticate
-  all catalog and storage operations — no separate identity provider.
-- SQE creates the namespace itself with `CREATE SCHEMA`, which makes the calling
-  principal its owner and avoids Lake Formation permission conflicts.
-- `run.sh` runs the full loop: CDK deploy → start SQE → run queries → capture
-  output → delete table and namespace → CDK destroy.
+## Components
 
-## What it demonstrates
+| Piece | Role |
+|---|---|
+| `cdk/` (TypeScript) | Creates an S3 Tables table bucket (`cdk deploy`) and removes it (`cdk destroy`). |
+| `docker-compose.yml` | Runs just the SQE coordinator with the s3tables backend; AWS credentials passed via env. |
+| `sqe.toml` | Annotated config template; `run.sh` fills in the table-bucket ARN and region. |
 
-- SQE connecting to AWS S3 Tables as a managed, non-REST Iceberg catalog.
-- Full create/write/read round-trip: `CREATE SCHEMA` → `CREATE TABLE` →
-  `INSERT` → `SELECT … GROUP BY`, all against live S3 Tables.
-- Clean teardown: the table bucket, namespace, and table are all removed; no
-  resources left in the account.
+## Configuration
 
-**Status:** validated (2026-06-06).
+### Backend (sqe.toml)
 
-## Run it
+```toml
+[catalog.backend]
+type = "s3tables"
+table_bucket_arn = "__TABLE_BUCKET_ARN__"   # run.sh fills this in from CDK outputs
 
-Full config, CDK stack, `docker compose`, queries, and captured output are in the repo:
+[storage]
+s3_region = "__REGION__"
+s3_path_style = false
 
-**→ [quickstart/aws-s3-tables/](https://github.com/schubergphilis/sqe/tree/main/quickstart/aws-s3-tables/)**
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
+```
 
-```bash
-cd quickstart/aws-s3-tables
-cp .env.example .env
-./run.sh
+The s3tables backend registers under the SQL catalog name `iceberg`, so tables are `iceberg.<namespace>.<table>`. Auth is the `anonymous` dev provider; S3 Tables authenticates via AWS IAM.
+
+### SQL (queries.sql)
+
+```sql
+-- Create the namespace (SQE -> S3 Tables CreateNamespace)
+CREATE SCHEMA IF NOT EXISTS iceberg.demo;
+
+DROP TABLE IF EXISTS iceberg.demo.events;
+CREATE TABLE iceberg.demo.events (
+    id     BIGINT,
+    kind   VARCHAR,
+    amount DOUBLE
+);
+
+INSERT INTO iceberg.demo.events VALUES
+    (1, 'click',    1.50),
+    (2, 'purchase', 42.00),
+    (3, 'click',    0.75),
+    (4, 'purchase', 13.25);
+
+SELECT kind, COUNT(*) AS n, ROUND(SUM(amount), 2) AS total
+FROM iceberg.demo.events
+GROUP BY kind
+ORDER BY total DESC;
+```
+
+## The test
+
+`run.sh` runs the full create/write/read round-trip against a real S3 Tables table bucket. It: deploys the CDK stack (table bucket) → generates `sqe.toml.local` from the stack outputs → starts SQE → executes `queries.sql` (CREATE SCHEMA → CREATE TABLE → INSERT → SELECT) and captures output to `OUTPUT.md` → then tears down: deletes the SQE-created table and namespace (S3 Tables won't delete a non-empty bucket), then `cdk destroy`.
+
+Validated live 2026-06-06 (account `ACCOUNT_ID`, eu-example-1): full round-trip succeeded, teardown left no leftover stack, bucket, namespace, or table.
+
+## Output
+
+```
+sqe-cli 0.31.4 connected to http://localhost:50051 (flight)
+(0 rows)
+(0 rows)
+(0 rows)
+(0 rows)
++----------+---+-------+
+| kind     | n | total |
++----------+---+-------+
+| purchase | 2 | 55.25 |
+| click    | 2 | 2.25  |
++----------+---+-------+
+(2 rows)
 ```

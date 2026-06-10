@@ -1,58 +1,90 @@
----
-slug: glue-lake-formation
-title: "AWS Glue + Lake Formation"
-description: "Run SQE against a Lake-Formation-governed AWS Glue database. A CDK stack creates the database (so LF governs it); the run shows SQE denied until an explicit LF grant, then succeeding. Table/database-level LF permissions, not column/row masking."
----
-
 # AWS Glue + Lake Formation
 
-Point SQE at an AWS Glue database that **Lake Formation governs**. Unlike the
-[`aws-glue` quickstart](./aws-glue.md), which lets SQE create the database
-(making the caller its owner to sidestep LF), here the database is created by
-CloudFormation. In a Lake-Formation-enabled account that means it is governed
-with no grants, so SQE is **denied** until you grant it LF permissions
-explicitly. The run shows the denial, the grant, and the same statement
-succeeding.
+## Goal
 
-## How it works
+Point SQE at an AWS Glue database that Lake Formation governs. Unlike the `aws-glue` quickstart (which lets SQE create the database, making the caller its owner to side-step LF), here the database is created by CloudFormation. In a Lake-Formation-enabled account that means it is governed with no grants, so SQE is denied until the principal is granted LF permissions explicitly.
 
-- A **TypeScript CDK stack** creates both an S3 warehouse bucket and an
-  LF-governed Glue database. Because CloudFormation creates the database, Lake
-  Formation governs it with no permissions granted by default.
-- **Phase A**: `run.sh` starts SQE and runs `queries.sql`. `CREATE TABLE` fails
-  with an LF `AccessDeniedException` — the principal has no LF permission on the
-  database.
-- **Grant**: `run.sh` calls `aws lakeformation grant-permissions` to give the
-  principal `CREATE_TABLE`, `ALTER`, `DROP`, and `DESCRIBE` on the database.
-- **Phase B**: `run.sh` restarts SQE (to flush any cached state) and runs the
-  same queries. `CREATE TABLE` → `INSERT` → `SELECT` all succeed.
-- CDK destroy removes the database, bucket, and LF grant. Nothing is left behind.
+The run demonstrates the full arc: denial, the grant, and the same statements succeeding. Be precise about the boundary: LF governs the Glue catalog operations SQE calls (`CreateTable`, `GetTable`). SQE reads Iceberg data files straight from S3 with the caller's IAM credentials and does not enforce LF column-masking or row-filtering. Fine-grained access here means table/database-level permission gating, not cell-level filtering. SQE's own column/row masking is the OPA/Cedar policy engine, independent of the catalog.
 
-Note the boundary: this quickstart demonstrates **table- and database-level** LF
-permission gating. SQE reads Iceberg data files from S3 directly with the
-caller's IAM credentials; it does not call Lake Formation's filtered
-credential-vending for column masking or row filtering. SQE's own column/row
-masking is a separate policy engine (OPA/Cedar plan rewriting).
+## Components
 
-## What it demonstrates
+| Piece | Role |
+|---|---|
+| `cdk/` (TypeScript) | Creates an S3 warehouse bucket **and** an LF-governed Glue database `sqe_lf_quickstart` (`cdk deploy`). `cdk destroy` removes both. |
+| `docker-compose.yml` | Runs just the SQE coordinator with the glue backend; AWS credentials passed via env. |
+| `sqe.toml` | Annotated config template; `run.sh` fills in the bucket URI and region. |
 
-- LF enforcement in action: `CREATE TABLE` denied before the grant, succeeding
-  after.
-- The deny → grant → succeed arc captured in a single `run.sh` run.
-- Full create/write/read round-trip in Phase B: `CREATE TABLE` → `INSERT` →
-  `SELECT … GROUP BY`.
-- Clean teardown: no stack, database, bucket, or LF grants left in the account.
+## Configuration
 
-**Status:** validated (2026-06-07).
+### Backend (sqe.toml)
 
-## Run it
+```toml
+[catalog.backend]
+type = "glue"
+region = "__REGION__"
+warehouse = "__WAREHOUSE__"   # s3://<bucket>/ from CDK outputs; run.sh fills this in
 
-Full config, CDK stack, `docker compose`, queries, and captured output are in the repo:
+[storage]
+s3_region = "__REGION__"
+s3_path_style = false
 
-**→ [quickstart/glue-lake-formation/](https://github.com/schubergphilis/sqe/tree/main/quickstart/glue-lake-formation/)**
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
+```
 
-```bash
-cd quickstart/glue-lake-formation
-cp .env.example .env
-./run.sh
+Config is identical to `aws-glue`; the difference is operational. The database is created by CloudFormation (not SQE), so Lake Formation governs it with no grants until one is added explicitly.
+
+### SQL (queries.sql)
+
+```sql
+-- No CREATE SCHEMA: the database already exists (CloudFormation made it).
+-- Phase A: denied by LF. Phase B (after the grant): succeeds.
+CREATE TABLE iceberg.sqe_lf_quickstart.events (
+    id     BIGINT,
+    kind   VARCHAR,
+    amount DOUBLE
+);
+
+INSERT INTO iceberg.sqe_lf_quickstart.events VALUES
+    (1, 'click',    1.50),
+    (2, 'purchase', 42.00),
+    (3, 'click',    0.75),
+    (4, 'purchase', 13.25);
+
+SELECT kind, COUNT(*) AS n, ROUND(SUM(amount), 2) AS total
+FROM iceberg.sqe_lf_quickstart.events
+GROUP BY kind
+ORDER BY total DESC;
+```
+
+## The test
+
+`run.sh` runs the full denial → grant → success arc against a real LF-governed Glue database. It: deploys the CDK stack (S3 bucket + LF-governed Glue database) → starts SQE → **Phase A**: executes `queries.sql` and captures the LF denial → issues `aws lakeformation grant-permissions` (`CREATE_TABLE ALTER DROP DESCRIBE` on the database) → restarts SQE to clear any stale catalog state → **Phase B**: re-runs the same statements and captures success → drops the SQE-created table (so CDK can delete the database) → `cdk destroy` (also revokes the LF grant).
+
+The caller must be a Lake Formation data-lake admin. The account must have LF enforcement on (`CreateDatabaseDefaultPermissions` empty); if `IAMAllowedPrincipals` is still the default, Phase A will not produce a denial.
+
+Validated live 2026-06-07 (account `ACCOUNT_ID`, eu-example-1): Phase A returned the LF `AccessDeniedException`; Phase B did CREATE TABLE → INSERT → SELECT cleanly; teardown left no stack, database, bucket, or LF grant.
+
+## Output
+
+```
+## Phase A -- before the LF grant: Lake Formation denies CREATE TABLE
+
+AccessDeniedException: Insufficient Lake Formation permission(s):
+Required Create Table on sqe_lf_quickstart
+
+## Phase B -- after the LF grant: the same statements succeed
+
+sqe-cli 0.31.4 connected to http://localhost:50051 (flight)
+(0 rows)
+(0 rows)
+(2 rows)
++----------+---+-------+
+| kind     | n | total |
++----------+---+-------+
+| purchase | 2 | 55.25 |
+| click    | 2 | 2.25  |
++----------+---+-------+
 ```
