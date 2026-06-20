@@ -25,14 +25,17 @@ GLOB="${2:-*.md}"
 
 # Case-insensitive leak regex (shared spec). jacobadmin/jacobbuilder matched
 # specifically (NOT bare "jacob") to avoid false hits on an author byline.
-REGEX='[0-9]{12}|chore/|feat/|crates/sqe-|eu-(central|west)|amazonaws|MR !|sbp\.gitlab|gitlab\.schubergphilis|vpf-data-ai|jacobadmin|jacobbuilder'
+# The 12-digit account-id rule is boundary-anchored so it does not substring-match
+# inside longer digit runs (e.g. 19-digit Iceberg snapshot ids). The canonical
+# placeholder account ids 123456789012 / 000000000000 are allowlisted below.
+REGEX='(^|[^0-9])[0-9]{12}([^0-9]|$)|chore/|feat/|crates/sqe-|eu-(central|west)|amazonaws|MR !|sbp\.gitlab|gitlab\.schubergphilis|vpf-data-ai|jacobadmin|jacobbuilder'
 
 # Collect hits. grep exits 1 when it finds nothing, which under `pipefail`
 # would abort the script on the (desired) clean case, so guard with `|| true`.
 hits=""
 while IFS= read -r -d '' f; do
   file_hits="$(
-    sed 's#crates/sqe-cli##g; s#crates/sqe-coordinator##g' "$f" \
+    sed 's#crates/sqe-cli##g; s#crates/sqe-coordinator##g; s#123456789012##g; s#000000000000##g' "$f" \
       | grep -Ein "$REGEX" \
       | sed "s#^#${f}:#" \
       || true
