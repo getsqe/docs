@@ -1,8 +1,8 @@
 # Security & Policy
 
-SQE enforces fine-grained security through **LogicalPlan rewriting** — injecting row filters and column masks into the query plan before DataFusion's optimizer runs.
+SQE enforces fine-grained security through **LogicalPlan rewriting**, injecting row filters and column masks into the query plan before DataFusion's optimizer runs.
 
-> **Status:** The policy enforcement framework is designed and stubbed (Phase 5). Currently, a `PassthroughEnforcer` is active, which returns plans unmodified.
+> **Status:** The plan-rewriting policy enforcer is implemented and pluggable, and it is **off by default**. The default policy engine is `passthrough` (`PassthroughEnforcer`), which returns plans unmodified, so enforcement is opt-in. The shipped, wired enforcement backend is Apache Ranger (with an in-memory store for dev and tests); OPA and Cedar are experimental and not yet wired. A default open-source deployment runs without any of this. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the SQL surface and the Chameleon / SBP note.
 
 ## Design Principle
 
@@ -21,9 +21,9 @@ graph TB
 ```
 
 This approach means:
-- **Row filters** are transparent — the user doesn't know they exist
-- **Column masks** block predicate pushdown on raw values — you can't `WHERE ssn = '123-45-6789'` to probe masked data
-- **Denied columns** are invisible — they don't appear in `SELECT *`, not as errors
+- **Row filters** are transparent. The user doesn't know they exist
+- **Column masks** block predicate pushdown on raw values. You can't `WHERE ssn = '123-45-6789'` to probe masked data
+- **Denied columns** are invisible. They don't appear in `SELECT *`, not as errors
 - **The optimizer can push user predicates through row filters** but not through column masks
 
 ## Policy Enforcer Trait
@@ -40,11 +40,13 @@ pub trait PolicyEnforcer: Send + Sync {
 ```
 
 Implementations:
-- **PassthroughEnforcer** — returns plan unchanged (current default)
-- **OPA Enforcer** — queries Open Policy Agent for policies (planned)
-- **Cedar Enforcer** — evaluates AWS Cedar policies locally (planned)
+- **PassthroughEnforcer**: returns plan unchanged (default; enforcement opt-in)
+- **Ranger**: reads row-filter and column-mask policies from Apache Ranger and feeds the plan rewriter (shipped, wired)
+- **InMemory**: grants stored in a hash map for dev and tests (shipped, wired)
+- **OPA Enforcer**: queries Open Policy Agent for policies (experimental, not yet wired)
+- **Cedar Enforcer**: evaluates AWS Cedar policies locally (experimental, not yet wired)
 
-## Planned SQL Extensions
+## SQL Extensions
 
 ```sql
 -- Grant row filter
@@ -55,8 +57,8 @@ GRANT SELECT ON sales TO ROLE analyst
 GRANT SELECT ON customers TO ROLE support
   MASKED WITH (ssn AS '***-**-' || RIGHT(ssn, 4));
 
--- View effective policies
-SHOW EFFECTIVE POLICY ON sales FOR ROLE analyst;
+-- View effective grants
+SHOW EFFECTIVE GRANTS FOR USER "alice";
 
 -- View grants
 SHOW GRANTS ON sales;

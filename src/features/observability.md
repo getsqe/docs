@@ -1,6 +1,6 @@
 # Observability
 
-SQE provides comprehensive observability through Prometheus metrics, OpenTelemetry traces/logs, and structured audit logging.
+SQE provides full observability through Prometheus metrics, OpenTelemetry traces/logs, and structured audit logging.
 
 ## Metrics (Prometheus)
 
@@ -33,6 +33,17 @@ histogram_quantile(0.99, rate(sqe_query_duration_seconds_bucket[5m]))
 # Active sessions
 sqe_active_sessions
 ```
+
+### Local observability stack
+
+For a self-contained metrics view alongside the test stack, SQE ships a Docker Compose overlay using VictoriaMetrics (Prometheus-compatible, around 30 MB RAM) and Grafana:
+
+```bash
+docker compose -f docker-compose.test.yml -f docker-compose.observability.yml up -d
+open http://localhost:13000    # Grafana, admin / admin
+```
+
+The overlay auto-scrapes the single-node coordinator (`localhost:19090`), the distributed coordinator (`localhost:29090`), and workers (`localhost:29091-29094`). A pre-built dashboard lives at `deploy/observability/sqe-benchmark-dashboard.json` and is auto-provisioned by the overlay. To import it manually, copy the JSON into your Grafana instance and point it at a Prometheus or VictoriaMetrics data source.
 
 ## Health Endpoints
 
@@ -97,17 +108,17 @@ Configuration:
 otlp_endpoint = "http://otel-collector:4317"
 ```
 
-When the endpoint is empty (default), SQE falls back to structured JSON logs on stdout — no external dependency required.
+When the endpoint is empty (default), SQE falls back to structured JSON logs on stdout, no external dependency required.
 
 ### Trace Spans
 
 Key spans emitted:
-- `sqe.query.execute` — full query lifecycle
-- `sqe.query.plan` — SQL parsing and planning
-- `sqe.policy.evaluate` — policy enforcement
-- `sqe.flight.do_get` — result streaming
-- `sqe.auth.handshake` — authentication
-- `sqe.worker.scan` — worker scan execution
+- `sqe.query.execute`: full query lifecycle
+- `sqe.query.plan`: SQL parsing and planning
+- `sqe.policy.evaluate`: policy enforcement
+- `sqe.flight.do_get`: result streaming
+- `sqe.auth.handshake`: authentication
+- `sqe.worker.scan`: worker scan execution
 
 ## Audit Log
 

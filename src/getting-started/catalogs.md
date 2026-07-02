@@ -22,7 +22,7 @@ just a warehouse path to walk.
 
 All six are smoke-tested in CI. Two of them, Glue and S3 Tables,
 are verified live against production AWS deployments (account
-`ACCOUNT_ID`, eu-example-1 and eu-example-2).
+`123456789012`, eu-example-1 and eu-example-2).
 
 ## Multiple catalogs in one coordinator
 
@@ -60,7 +60,7 @@ warehouse = "s3://my-bucket/wh"
 catalog_url = ""
 [catalogs.aws_s3tables.backend]
 type = "s3tables"
-table_bucket_arn = "arn:aws:s3tables:eu-example-2:ACCOUNT_ID:bucket/my-bucket"
+table_bucket_arn = "arn:aws:s3tables:eu-example-2:123456789012:bucket/my-bucket"
 
 [catalogs.legacy_hms]
 catalog_url = ""
@@ -195,6 +195,35 @@ REST is the most-tested path. Every benchmark suite (TPC-H, SSB,
 TPC-DS, TPC-C, TPC-E, TPC-BB, ClickBench) runs against the local
 Polaris stack on every release build.
 
+### Namespace visibility filtering
+
+On the REST backend, SQE hides the names of namespaces the caller
+holds no grants in from every metadata listing: `SHOW SCHEMAS`,
+`information_schema.schemata`, and Flight SQL `GetDbSchemas`. When the
+session's catalog provider is built, each namespace returned by
+`listNamespaces` is probed once with the caller's bearer token
+(`GetNamespace`, which Polaris authorizes as `LOAD_NAMESPACE_METADATA`
+per caller). A 403 drops the name. The probes run 8 at a time, once per
+session, never per query.
+
+The filter fails open. A probe that times out or errors for any reason
+other than 403 keeps the name listed. Namespace contents are protected
+by the per-operation checks regardless of what the list shows, so a
+catalog hiccup degrades to unfiltered listings instead of blanking the
+user's schema tree. `information_schema` itself is always listed and
+never probed.
+
+```toml
+[catalog]
+# default true; set false to restore unfiltered listings
+namespace_visibility_filter = false
+```
+
+Single-identity backends (Glue, HMS, JDBC, Hadoop) skip the filter
+entirely. They authenticate as the coordinator's service identity, so
+there is no per-caller answer to give. Those backends log a
+shared-identity warning at startup.
+
 ## HMS: Hive Metastore over Thrift
 
 For deployments still on Hive Metastore.
@@ -230,7 +259,7 @@ warehouse = "s3://my-bucket/warehouse"
 Run with the right AWS credentials:
 
 ```bash
-AWS_PROFILE=my-profile ./target/release/sqe-coordinator ~/sqe-config.toml
+AWS_PROFILE=my-profile ./target/release/sqe-server --config ~/sqe-config.toml
 ```
 
 The AWS SDK reads `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_REGION`,
@@ -241,7 +270,7 @@ tables.
 Pulls in `aws-sdk-glue` + `aws-config` (~50-80 MB).
 
 **Live verification (2026-05-05)** against AWS Glue in eu-example-1
-(account `ACCOUNT_ID`, database `iceberg_demo_analytics`):
+(account `123456789012`, database `iceberg_demo_analytics`):
 
 ```
 sqe> SHOW SCHEMAS;
@@ -285,7 +314,7 @@ by ARN.
 ```toml
 [catalog.backend]
 type             = "s3tables"
-table_bucket_arn = "arn:aws:s3tables:eu-example-2:ACCOUNT_ID:bucket/my-bucket"
+table_bucket_arn = "arn:aws:s3tables:eu-example-2:123456789012:bucket/my-bucket"
 # endpoint_url   = "http://localhost:4566"   # optional, custom endpoint
 ```
 
@@ -297,7 +326,7 @@ Pulls in `aws-sdk-s3tables`. Shares the AWS SDK runtime that
 AWS-enabled build is small (~5 MB).
 
 **Live verification (2026-05-05)** against
-`arn:aws:s3tables:eu-example-2:ACCOUNT_ID:bucket/testtablebucket`:
+`arn:aws:s3tables:eu-example-2:123456789012:bucket/testtablebucket`:
 
 ```
 sqe> SHOW SCHEMAS;

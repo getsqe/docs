@@ -67,7 +67,7 @@ ORDER BY total DESC;
 
 SQE creates the Glue database via `CREATE SCHEMA` rather than CDK. This is deliberate: in a Lake-Formation-enabled account, a database created out-of-band is LF-governed with no grants, which would deny `CreateTable`. A database SQE creates makes the calling principal its owner, granting the required permissions. This pattern works with or without Lake Formation. The `glue-lake-formation` quickstart explores the governed path instead.
 
-Validated live 2026-06-06 (account `ACCOUNT_ID`, eu-example-1): full round-trip succeeded, teardown left no leftover stack, bucket, or database.
+Validated live 2026-06-06 (account `123456789012`, eu-example-1): full round-trip succeeded, teardown left no leftover stack, bucket, or database.
 
 ## Output
 

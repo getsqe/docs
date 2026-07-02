@@ -64,7 +64,7 @@ ORDER BY total DESC;
 
 `run.sh` runs the full create/write/read round-trip against a real S3 Tables table bucket. It: deploys the CDK stack (table bucket) → generates `sqe.toml.local` from the stack outputs → starts SQE → executes `queries.sql` (CREATE SCHEMA → CREATE TABLE → INSERT → SELECT) and captures output to `OUTPUT.md` → then tears down: deletes the SQE-created table and namespace (S3 Tables won't delete a non-empty bucket), then `cdk destroy`.
 
-Validated live 2026-06-06 (account `ACCOUNT_ID`, eu-example-1): full round-trip succeeded, teardown left no leftover stack, bucket, namespace, or table.
+Validated live 2026-06-06 (account `123456789012`, eu-example-1): full round-trip succeeded, teardown left no leftover stack, bucket, namespace, or table.
 
 ## Output
 

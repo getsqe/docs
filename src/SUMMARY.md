@@ -20,6 +20,7 @@
 - [Authentication Flow](./architecture/auth-flow.md)
 - [Security & Policy](./architecture/security.md)
 - [Streaming Execution](./architecture/streaming-execution.md)
+- [Security and trust model](./architecture/security-model.md)
 - [Research Papers](./architecture/research-papers.md)
 
 ---
@@ -66,9 +67,18 @@
 
 ---
 
+# Reference
+
+- [Limitations and Known Gaps](./reference/limitations.md)
+- [SQL at a glance](./reference/sql-cheatsheet.md)
+- [SQE vs Trino, DuckDB, Spark](./reference/vs-other-engines.md)
+
+---
+
 # Getting Started
 
 - [Quickstart](./getting-started/quickstart.md)
+- [Connecting clients](./getting-started/connecting.md)
 - [Catalog backends](./getting-started/catalogs.md)
 - [Storage backends (S3 / R2 / GCS / ADLS / HTTPS / hf://)](./getting-started/storage-backends.md)
 - [Building from Source](./getting-started/building.md)
@@ -76,7 +86,7 @@
 
 ---
 
-# Quickstart
+# Quickstart Recipes
 
 - [Overview](./quickstart/index.md)
 - [Polaris + Keycloak (client credentials)](./quickstart/polaris-keycloak-client-id.md)
@@ -100,6 +110,7 @@
 # Deployment
 
 - [Configuration](./deployment/configuration.md)
+- [Sizing and capacity](./deployment/sizing.md)
 - [Docker](./deployment/docker.md)
 - [Kubernetes & Helm](./deployment/kubernetes.md)
 
@@ -109,7 +120,9 @@
 
 - [Lineage (OpenLineage)](./operations/openlineage.md)
 - [Runtime catalog management (ATTACH / DETACH / SECRETS)](./operations/catalogs.md)
+- [Audit Logging (OCSF)](./operations/audit-logging.md)
 - [Web UI](./operations/web-ui.md)
+- [On-Call Runbook](./operations/runbook.md)
 
 ---
 
@@ -118,3 +131,29 @@
 - [Rust Crate Structure](./development/crates.md)
 - [Testing](./development/testing.md)
 - [Roadmap](./development/roadmap.md)
+
+---
+
+# Design Notes
+
+- [Overview](./design-notes/index.md)
+- [DataFusion Architecture](./design-notes/datafusion-architecture.md)
+- [Ballista Evaluation](./design-notes/ballista-evaluation-learnings.md)
+- [dbt Compatibility](./design-notes/dbt-sqe.md)
+- [Fine-grained Policy](./design-notes/fine-grained-policy.md)
+- [Ranger Access Control](./design-notes/ranger-access-control.md)
+  - [Fine-grained Enforcement](./design-notes/ranger-fine-grained-enforcement.md)
+  - [Service Type](./design-notes/ranger-fine-grained-service-type.md)
+  - [Tag Storage Decision](./design-notes/ranger-tag-storage-decision.md)
+- [Spark / Ranger Parity](./design-notes/sqe-spark-ranger-parity.md)
+- [S3 Credential Vending](./design-notes/s3vending.md)
+- [Polaris Principal Provisioning](./design-notes/polaris-principal-provisioning.md)
+- [Row-level Writes](./design-notes/row-level-writes.md)
+- [Iceberg Caching Strategy](./design-notes/iceberg-caching-strategy.md)
+- [Change Data Capture](./design-notes/cdc.md)
+- [Merge-on-Read vs Copy-on-Write](./design-notes/mor-vs-cow.md)
+- [Runtime Filter Pushdown](./design-notes/runtime-filter-pushdown.md)
+- [SSB SF1 Trace](./design-notes/ssb-sf1-trace.md)
+- [Quack Protocol](./design-notes/quack-protocol.md)
+- [Trino Client Compatibility](./design-notes/trino-client-compatibility.md)
+- [HuggingFace Glob Research](./design-notes/hf-glob-research.md)

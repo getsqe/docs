@@ -65,7 +65,7 @@ ORDER BY total DESC;
 
 The caller must be a Lake Formation data-lake admin. The account must have LF enforcement on (`CreateDatabaseDefaultPermissions` empty); if `IAMAllowedPrincipals` is still the default, Phase A will not produce a denial.
 
-Validated live 2026-06-07 (account `ACCOUNT_ID`, eu-example-1): Phase A returned the LF `AccessDeniedException`; Phase B did CREATE TABLE → INSERT → SELECT cleanly; teardown left no stack, database, bucket, or LF grant.
+Validated live 2026-06-07 (account `123456789012`, eu-example-1): Phase A returned the LF `AccessDeniedException`; Phase B did CREATE TABLE → INSERT → SELECT cleanly; teardown left no stack, database, bucket, or LF grant.
 
 ## Output
 
