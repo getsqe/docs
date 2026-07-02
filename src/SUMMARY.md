@@ -93,6 +93,8 @@
 - [Polaris + Keycloak (user token)](./quickstart/polaris-keycloak-user-token.md)
 - [Project Nessie (Iceberg REST catalog)](./quickstart/nessie.md)
 - [Unity Catalog OSS (Iceberg REST, read-only)](./quickstart/unity-oss.md)
+- [Polaris + Apache Ranger + Keycloak](./quickstart/polaris-ranger-keycloak.md)
+- [Service principals (client credentials)](./quickstart/polaris-ranger-service-principal.md)
 - [AWS S3 Tables (managed Iceberg)](./quickstart/aws-s3-tables.md)
 - [AWS Glue Data Catalog](./quickstart/aws-glue.md)
 - [AWS Glue + Lake Formation](./quickstart/glue-lake-formation.md)
@@ -103,6 +105,7 @@
   - [Quack protocol reference](./quickstart/quack-protocol.md)
   - [Quack data-type matrix](./quickstart/quack-datatype-matrix.md)
 - [Observability: metrics + Grafana](./quickstart/observability.md)
+- [Distributed: coordinator + workers](./quickstart/distributed.md)
 - [Benchmarks: TPC-H / TPC-DS / SSB](./quickstart/benchmark.md)
 
 ---

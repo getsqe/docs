@@ -38,7 +38,7 @@ Trino wins on simple single-table scans (ClickBench) due to JVM JIT compilation 
 | dbt-trino | 1.9.x | ✅ | ✅ | ✅ | ✅ | ✅ exercised end-to-end in the remote test setup (native dbt-sqe adapter is the primary path) |
 | Superset (SQLAlchemy) | 4.x | ✅ | ✅ | ✅ | ⏭️ | ✅ SQLAlchemy reflection + query paths verified live via the shared wire protocol; not run inside a Superset GUI |
 | DBeaver (Trino) | 24.x | ✅ | ✅ | ✅ | ⏭️ | ✅ same JDBC metadata paths verified live; not run inside the DBeaver GUI |
-| trino-cli | 465 | ⏭️ | ⏭️ | ⏭️ | ⏭️ | ⏭️ not tested (uses the same client protocol as the JDBC row above) |
+| trino-cli | 476 | ✅ | ✅ | ✅ | ⏭️ | ✅ official Trino CLI 476 ran SHOW/DESCRIBE/typed queries live 2026-07-02 over the TLS route |
 
 Rating: ✅ works | ⚠️ partial (with workaround) | ❌ broken | ⏭️ not tested
 
@@ -63,9 +63,11 @@ Drove the Trino client protocol (what the JDBC driver and the SQLAlchemy dialect
 | Typed timestamp | `date_trunc('month', CAST(now() AS timestamp))` | `timestamp(6)` with `rawType: "timestamp"` and precision in `arguments`; value normalized to 6 fractional digits |
 | Computed aggregate | `count(*)` | type `bigint`, value rendered as a JSON number |
 | Time-series chart | `date_trunc('quarter', ...) GROUP BY 1` | `timestamp(6)` + `bigint`, correct rows |
-| Pagination | `SELECT * ... LIMIT 2500` then follow `nextUri` | `nextUri` chain followed to `FINISHED` (demo table fit one page, so multi-page was not stressed) |
+| Pagination | 83,521-row result, follow `nextUri` | 84 pages of 1000 rows (521 on the last), exact row count, `RUNNING` -> `FINISHED`; the `max_result_rows` guard rejects oversized results cleanly |
 
-The one open edge is error detail: a type-mismatched parameter returns `DataInvalid => Can't convert datum ...` rather than a Trino-idiomatic type error. That matches the known error-message gap below, not a compatibility break.
+A type-mismatched predicate (for example `WHERE varchar_col = 1`) used to return `errorName: EXECUTION_FAILED`, `errorType: INTERNAL_ERROR`, and the raw `DataInvalid => Can't convert datum ...` string, which told a BI client the engine was broken rather than the query. That now classifies as `TYPE_MISMATCH` (`USER_ERROR`) with the `DataInvalid => ` wrapper stripped. Genuinely bad SQL already surfaced well (`Invalid function 'frobnicate'. Did you mean 'truncate'?`). The remaining error-detail work is the generic-message cases noted below.
+
+Cross-checked with the official Trino CLI 476 (the same client protocol the JDBC driver uses) pointed at the TLS route `https://localhost/v1/` (nginx proxies it to `sqe:8080`; password auth over the wire requires TLS): `SHOW SCHEMAS`, `SHOW TABLES`, quoted three-part `DESCRIBE` (rendered as Trino's `Column | Type | Extra | Comment`), and a `date_trunc('month', ...) , count(*)` query all returned correctly, with timestamps normalized to 6 fractional digits.
 
 ## Trino HTTP v1/statement Protocol (curl)
 

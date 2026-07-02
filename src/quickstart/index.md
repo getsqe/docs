@@ -22,6 +22,8 @@ how to use it.
 | [Polaris + Keycloak (user token)](./polaris-keycloak-user-token.md) | Same stack; clients bring a pre-minted Keycloak token, SQE validates + passes it through | validated |
 | [Project Nessie](./nessie.md) | Nessie as the Iceberg REST catalog (auth-less, anonymous SQE) | validated |
 | [Unity Catalog OSS](./unity-oss.md) | Unity Catalog OSS over Iceberg REST (read-only; catalog-browse demo) | validated |
+| [Polaris + Apache Ranger + Keycloak](./polaris-ranger-keycloak.md) | `GRANT`/`REVOKE` become Ranger policies enforced by Polaris; column masks match Spark byte-for-byte | validated |
+| [Service principals (client credentials)](./polaris-ranger-service-principal.md) | Clients bring their own OAuth2 client_id/secret; per-connection identity, authorized by Ranger at Polaris | validated |
 
 ### AWS managed catalogs (CDK bootstrap + teardown)
 
@@ -45,6 +47,7 @@ how to use it.
 | Quickstart | What it shows | Status |
 |---|---|---|
 | [Observability: metrics + Grafana](./observability.md) | Scrape SQE's Prometheus metrics with VictoriaMetrics + Grafana | validated |
+| [Distributed: coordinator + workers](./distributed.md) | One coordinator + two stateless workers over Arrow Flight; fragments dispatched to workers | validated |
 
 ### Benchmarks
 
