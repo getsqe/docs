@@ -21,9 +21,8 @@ The Trino HTTP listener runs alongside Flight SQL. The default port is `8080`
 (the test/distributed compose files map it to `28080`):
 
 ```toml
-[trino_compat]
-enabled = true
-port    = 8080
+[coordinator]
+trino_http_port = 8080    # 0 to disable
 ```
 
 ### Run
@@ -76,15 +75,15 @@ docker compose -f docker-compose.test.yml -f docker-compose.distributed.yml up -
 ### Run
 
 ```bash
-./scripts/distributed-test.sh
+scripts/test.sh scenario distributed
 ```
 
-The script exercises the Trino HTTP endpoint on `28080` (test 11) alongside the
+The scenario exercises the Trino HTTP endpoint on `28080` alongside the
 Flight path and confirms worker dispatch.
 
 ### Expected output
 
-`distributed-test.sh` test 11 submits a query to the Trino HTTP endpoint on the
+The distributed scenario's Trino check submits a query to the HTTP endpoint on the
 coordinator (`28080`) and follows `nextUri` to completion, alongside the Flight
 path on the same cluster. This is covered by the suite; the docker-dependent
 re-run was not repeated this round (see the validation matrix note on local
@@ -103,5 +102,5 @@ above are the regression guard.
 - Authentication needs Basic auth (`-u user:password`) to populate the session,
   not just the `X-Trino-User` header. For the local root client the password is
   empty (`-u root:`).
-- The Trino layer is optional; enable it with `[trino_compat] enabled = true`.
-  Flight SQL is the recommended protocol for SQE-native clients.
+- The Trino HTTP endpoint is enabled by default on `[coordinator] trino_http_port = 8080`;
+  set the port to `0` to disable it. Flight SQL is the recommended protocol for SQE-native clients.

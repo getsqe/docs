@@ -23,17 +23,17 @@ gantt
     section Shipped
     Phase 2c - dbt Compatibility :done, p2c, 2026-03, 2026-04
     Phase 5 - Pluggable Catalogs :done, p5, 2026-04, 2026-05
+    Phase 6 - Security Policies  :done, p6, 2026-05, 2026-06
     Phase 7 - Iceberg V3         :done, p7, 2026-04, 2026-05
     Phase 9 - OpenLineage        :done, p9, 2026-05, 2026-05
 
     section Next
-    Phase 6 - Security Policies  :p6, 2026-05, 2026-07
     Phase 8 - Trino Decommission :p8, 2026-07, 2026-09
 ```
 
 ---
 
-## Phase 1 — Single-Node Engine (Done)
+## Phase 1 - Single-Node Engine (Done)
 
 The foundation: a working SQL engine that queries Iceberg tables through Polaris with Keycloak auth.
 
@@ -45,7 +45,7 @@ The foundation: a working SQL engine that queries Iceberg tables through Polaris
 - `SELECT`, `SHOW CATALOGS/SCHEMAS/TABLES`, `EXPLAIN`
 - Prometheus metrics + structured JSON logging
 
-## Phase 2 — Write Path & Views (Done)
+## Phase 2 - Write Path & Views (Done)
 
 SQL write operations and catalog DDL.
 
@@ -56,11 +56,12 @@ SQL write operations and catalog DDL.
 - `CREATE SCHEMA` / `DROP SCHEMA`
 - `DROP TABLE` / `DROP TABLE IF EXISTS`
 - Parquet writer (to S3 via Iceberg)
-- Audit logging (JSONL)
+- Write-path memory safety: pool-tracked write buffers (oversized writes fail with a typed `ResourceExhausted` instead of OOM), streaming ingest/CTAS/INSERT, and an opt-in bounded fanout writer (see [Write Path, Memory Safety](../features/write-path.md#memory-safety))
+- Audit logging (JSONL, OCSF): canonical `AuditEvent`, OCSF class mapping, tamper-evident hash chain, GDPR-tag masking, identity enrichment
 - OpenTelemetry export (OTLP/gRPC)
 - Trino-compatible HTTP endpoint
 
-## Phase 2c — dbt Compatibility (Done)
+## Phase 2c - dbt Compatibility (Done)
 
 Native dbt support via `dbt-sqe` adapter over ADBC Flight SQL.
 
@@ -73,7 +74,7 @@ Native dbt support via `dbt-sqe` adapter over ADBC Flight SQL.
 
 ---
 
-## Phase 3 — Row-Level Writes (Done)
+## Phase 3 - Row-Level Writes (Done)
 
 DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/` (DF 53.1 + Arrow 58 rebase of `risingwavelabs/iceberg-rust`), which provides `rewrite_files()` transaction support.
 
@@ -102,9 +103,9 @@ CoW rewrites affected data files entirely. MoR has shipped: set `TBLPROPERTIES (
 
 ### Delivered
 
-- `DELETE FROM table WHERE condition` — removes matching rows; supports cross-table subqueries; DELETE without WHERE = truncate
-- `UPDATE table SET col = expr WHERE condition` — modifies matching rows; supports CASE WHEN transformations and cross-table subqueries
-- `MERGE INTO target USING source ON condition WHEN MATCHED/NOT MATCHED ...` — full outer join approach with WHEN MATCHED/NOT MATCHED clauses
+- `DELETE FROM table WHERE condition` - removes matching rows; supports cross-table subqueries; DELETE without WHERE = truncate
+- `UPDATE table SET col = expr WHERE condition` - modifies matching rows; supports CASE WHEN transformations and cross-table subqueries
+- `MERGE INTO target USING source ON condition WHEN MATCHED/NOT MATCHED ...` - full outer join approach with WHEN MATCHED/NOT MATCHED clauses
 - All operations atomic via Iceberg snapshot isolation
 - dbt `incremental` with `merge` strategy
 - Integration tests against Polaris + MinIO
@@ -127,7 +128,7 @@ Uses the iceberg-rust fork vendored at `vendor/iceberg-rust/` for `rewrite_files
 
 ---
 
-## Phase 7 — Iceberg V3 (Done)
+## Phase 7 - Iceberg V3 (Done)
 
 Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 53.1 + Arrow 58 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/iceberg-matrix.md`).
 
@@ -160,7 +161,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 
 ---
 
-## Phase 4b/4c — Distributed Execution (Done)
+## Phase 4b/4c - Distributed Execution (Done)
 
 Scale-out query execution with stateless workers. Implemented via streaming execution in two phases.
 
@@ -189,8 +190,8 @@ graph TB
 
 - **Phase A (spill-to-disk):** FairSpillPool with watermarks, late materialization, file/page pruning, TopK, S3 I/O pipeline (coalescing, footer cache, prefetch), SortMergeJoin fallback
 - **Phase B (distributed):** DoExchange shuffle, distributed sort (range-partition with sampling), two-phase aggregation, distributed joins (broadcast, shuffle hash, pre-sorted merge, predicate transfer), multi-endpoint Flight SQL, stage decomposition
-- **Adaptive sort stripping** — memory-aware sort mode selection
-- **Metrics** — spill, shuffle, late-mat, pruning, time-to-first-row, S3 I/O, auth, write path
+- **Adaptive sort stripping** - memory-aware sort mode selection
+- **Metrics** - spill, shuffle, late-mat, pruning, time-to-first-row, S3 I/O, auth, write path
 
 ### Benchmark Results (SF1, distributed 2-worker)
 
@@ -203,13 +204,13 @@ graph TB
 
 ---
 
-## Phase 5 — Pluggable Catalogs (Done)
+## Phase 5 - Pluggable Catalogs (Done)
 
 `CatalogBackend` trait replaced the hard-coded Polaris REST catalog. Seven catalog backends ship today:
 
 | Backend | Status |
 |---|---|
-| Iceberg REST (Polaris, Lakeformation) | Done — default |
+| Iceberg REST (Polaris, Lakeformation) | Done - default |
 | AWS Glue | Done |
 | Nessie | Done |
 | Hive Metastore (Thrift) | Done |
@@ -221,20 +222,28 @@ Multi-cloud storage via `object_store`: S3 (+ endpoint override for R2, Ceph, Ga
 
 ---
 
-## Phase 6 — Security Policies (Planned)
+## Phase 6 - Security Policies (Shipped, off by default)
 
-Fine-grained access control via LogicalPlan rewriting.
+Fine-grained access control via LogicalPlan rewriting. Implemented and pluggable, and **off by default**: the policy engine defaults to `passthrough` and `access_control.backend` defaults to `none`, so enforcement is opt-in. See [GRANT and REVOKE](../sql-reference/grant-revoke.md) for the SQL surface, backends, and known gaps.
 
-- `PolicyEnforcer` implementations (OPA via Rego, Cedar)
+Shipped:
+
+- Plan-rewriting `PolicyEnforcer` (row filters and column masks injected before optimization)
 - `GRANT/REVOKE` with `ROWS WHERE` and `MASKED WITH`
-- `SHOW GRANTS` / `SHOW EFFECTIVE POLICY`
+- `SHOW GRANTS` / `SHOW EFFECTIVE GRANTS` / `CHECK ACCESS`
 - Column restriction (invisible columns)
 - Policy caching with TTL (moka)
 - No-information-leakage model (PostgreSQL RLS style)
+- Wired backends: Apache Ranger (production) and an in-memory store (dev / tests)
+
+Not yet wired:
+
+- OPA (Rego) and Cedar policy engines are present as configuration options but remain experimental
+- See the "Known gaps" in [GRANT and REVOKE](../sql-reference/grant-revoke.md) for SQL-surface limits (no `WITH GRANT OPTION`, table-level INSERT only, scalar-only masks)
 
 ---
 
-## Phase 9 — OpenLineage Emitter (Done)
+## Phase 9 - OpenLineage Emitter (Done)
 
 Coordinator-side OpenLineage 2-0-2 emitter with column-level lineage. Off by default; zero hot-path overhead when disabled.
 
@@ -247,7 +256,7 @@ Deferrals (documented): mTLS, per-event user-OIDC bearer forwarding, MERGE per-b
 
 ---
 
-## Phase 10 — Performance & Reliability Testing (Planned)
+## Phase 10 - Performance & Reliability Testing (Planned)
 
 Validate SQE is production-ready through systematic benchmarking and reliability testing.
 
@@ -284,11 +293,11 @@ graph LR
 
 #### Key Metrics
 
-- **Query latency** — P50, P95, P99 per query
-- **Throughput** — queries/second under load
-- **Memory usage** — peak RSS per query complexity
-- **Startup time** — cold start to first query
-- **Scan speed** — GB/s from S3 (single-node vs distributed)
+- **Query latency** - P50, P95, P99 per query
+- **Throughput** - queries/second under load
+- **Memory usage** - peak RSS per query complexity
+- **Startup time** - cold start to first query
+- **Scan speed** - GB/s from S3 (single-node vs distributed)
 
 #### Performance Targets
 
@@ -315,10 +324,10 @@ graph LR
 
 ### Profiling & Optimization
 
-- **CPU profiling** — `perf` + flamegraphs on hot queries
-- **Memory profiling** — `jemalloc` stats, allocation tracking
-- **I/O profiling** — S3 request counts, Parquet read amplification
-- **Query plan analysis** — DataFusion `EXPLAIN ANALYZE` for bottleneck identification
+- **CPU profiling** - `perf` + flamegraphs on hot queries
+- **Memory profiling** - `jemalloc` stats, allocation tracking
+- **I/O profiling** - S3 request counts, Parquet read amplification
+- **Query plan analysis** - DataFusion `EXPLAIN ANALYZE` for bottleneck identification
 
 ### Deliverables
 
@@ -331,13 +340,13 @@ graph LR
 
 ---
 
-## Phase 8 — Trino Decommission (Future)
+## Phase 8 - Trino Decommission (Future)
 
-Complete migration from Trino DCAF fork.
+Complete migration from Trino DCAF fork. The BI-tool slice has largely landed: Metabase and the Trino JDBC driver connect, sync schemas, and run typed queries against the Trino HTTP endpoint, and Superset rides the same path (see [Trino Compatibility](../features/trino-compatibility.md)). What remains is the wind-down of the fork itself.
 
-- Full Trino wire protocol compatibility for remaining tools
+- Full Trino wire protocol compatibility for remaining tools (BI tools done; DBeaver/dbt-trino exercised)
 - Dashboard migration playbook (Superset, Grafana, etc.)
-- JDBC driver migration guide (Trino JDBC → Flight SQL JDBC)
+- JDBC driver migration guide (Trino JDBC to Flight SQL JDBC)
 - Performance parity validation (benchmark comparison)
 - Runbook for operators
 - Trino fork sunset and decommission

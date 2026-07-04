@@ -1,60 +1,98 @@
----
-slug: quack
-title: "Quack: the DuckDB wire protocol"
-description: "SQE speaks DuckDB's Quack RPC protocol both ways: as a server (a DuckDB CLI queries SQE) and as a client (SQE's quack_query() pulls from a remote Quack endpoint). run.sh proves the forward round-trip with a local DuckDB 1.5.3; the reverse is documented and verified."
----
-
 # Quack: the DuckDB wire protocol
+
+## Goal
 
 Quack is DuckDB's RPC protocol. A DuckDB client can `ATTACH 'quack:host:port'`
 and query a remote engine as though it were a local database.
 
-SQE speaks Quack **both ways**:
+SQE speaks Quack in both directions. As a **server**, a DuckDB client queries
+SQE's Iceberg catalogs over the Quack endpoint (`coordinator.quack_port`). As a
+**client**, SQE's `quack_query()` table function pulls rows from a remote Quack
+endpoint — another SQE instance, or a DuckDB running `quack_serve`. This
+quickstart is experimental: Quack is pre-release upstream (targeting DuckDB v2.0)
+and the client extension ships from `core_nightly`. The round-trip works today
+with duckdb 1.5.3 but the protocol surface is not yet stable.
 
-- **As a server** — a DuckDB client queries SQE's catalogs over the Quack
-  endpoint (`quack_port` in the coordinator config).
-- **As a client** — SQE's `quack_query()` table function pulls rows from a
-  remote Quack endpoint (another SQE instance, or a DuckDB running
-  `quack_serve`).
+## Components
 
-## How it works
+| Service | Role |
+|---|---|
+| `rustfs` | S3-compatible object store (the Iceberg data warehouse) |
+| `bucket-init` | One-shot container that creates the `warehouse` bucket in RustFS |
+| `nessie` | Iceberg REST catalog (auth-less, in-memory version store) |
+| `sqe` | Coordinator with `quack_port = 9494` — the Quack RPC endpoint |
+| DuckDB CLI (optional) | Local client for the forward round-trip; not part of the stack |
 
-- The stack is a queryable SQE with a Nessie catalog and RustFS warehouse
-  storage — the same base as the [Nessie quickstart](./nessie.md) — plus the
-  Quack endpoint enabled on the coordinator.
-- Setting `quack_port` in the coordinator config is all that is needed to enable
-  the endpoint. It serves a `GET /` identification probe and a `POST /quack`
-  RPC surface.
-- `run.sh` always validates the server-side probe (`GET /`). If a local DuckDB
-  1.5.3+ is on your PATH, it also seeds an Iceberg table in SQE and has DuckDB
-  query it over Quack via the `quack_query()` table function.
-- The reverse direction (SQE as a Quack client, pulling from a DuckDB
-  `quack_serve` instance) is documented in the repo README and verified
-  separately — SQE's `quack_query()` function is available on every session.
+## Configuration
 
-Note that Quack is a **pre-release protocol**: DuckDB plans to stabilize it
-around v2.0, and the client extension ships from `core_nightly`. The round-trip
-works today (validated with duckdb 1.5.3) but is not a stable surface yet.
+### Backend (sqe.toml)
 
-## What it demonstrates
+```toml
+[coordinator]
+flight_sql_port = 50051
+trino_http_port = 8080
+quack_port = 9494        # enables the DuckDB Quack RPC endpoint
+mode = "hybrid"
 
-- Enabling SQE's Quack server endpoint with a single config key.
-- The `GET /` identification probe confirming the endpoint is live.
-- A DuckDB client querying an SQE Iceberg table over the Quack protocol
-  (forward round-trip).
-- SQE as a Quack client: `quack_query()` pulling rows from a remote DuckDB
-  `quack_serve` instance (reverse direction, documented and verified).
+[auth]
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
 
-**Status:** experimental (2026-06-07).
+[catalogs.nessie]
+polaris_url = "http://nessie:19120/iceberg"
+warehouse = "warehouse"
 
-## Run it
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_region = "us-east-1"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+```
 
-Full config, `docker compose`, queries, and captured output are in the repo:
+Setting `quack_port` enables the endpoint. The `anonymous` auth provider accepts
+any non-empty token — dev mode only. For real auth, swap in the
+`polaris-keycloak-*` quickstart's auth section.
 
-**→ [quickstart/quack/](https://github.com/schubergphilis/sqe/tree/main/quickstart/quack/)**
+## The test
 
-```bash
-cd quickstart/quack
-cp .env.example .env
-./run.sh
+`run.sh` brings the full stack up via `docker compose up -d --wait`, then probes
+the Quack endpoint with `GET /` to confirm SQE identifies as a DuckDB Quack
+server. If a local `duckdb` 1.5.3+ is on PATH, it goes further: seeds an Iceberg
+table in SQE (`nessie.demo.events`), installs the pre-release quack extension
+(`INSTALL quack FROM core_nightly`), and has DuckDB run `quack_query()` against
+SQE — aggregating the result locally. The server probe always runs; the
+round-trip is skipped (with instructions) when DuckDB is not found. Output is
+captured to `OUTPUT.md`. Last validated 2026-06-07 with duckdb 1.5.3.
+
+Tear down with `./run.sh --down`.
+
+## Output
+
+```
+## The Quack endpoint identifies itself (`GET /`)
+$ curl http://localhost:19494/
+This is a DuckDB Quack RPC endpoint, served by SQE.
+
+## A DuckDB CLI queries an SQE Iceberg table over Quack
+┌──────────┬───────┬────────┐
+│   kind   │   n   │ total  │
+│ varchar  │ int64 │ double │
+├──────────┼───────┼────────┤
+│ purchase │     2 │  55.25 │
+│ click    │     2 │   2.25 │
+└──────────┴───────┴────────┘
+
+## SQE logs on startup (Quack enabled, with its security warnings)
+WARNING: the Quack endpoint has NO rate limiting on its auth path -- it is an
+un-throttled brute-force / IdP-amplification oracle. Restrict network access to
+the Quack port until QUACK-08 lands.
+WARNING: the Quack endpoint is PLAINTEXT (no TLS) and binds 0.0.0.0 -- user OIDC
+bearer tokens travel in cleartext and can be captured and replayed. Set
+[coordinator.tls] cert_file/key_file to enable TLS, or do not expose the Quack
+port on untrusted networks.
+DuckDB Quack RPC on port 9494 (plaintext)
 ```

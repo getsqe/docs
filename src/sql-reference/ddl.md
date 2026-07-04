@@ -110,7 +110,7 @@ Iceberg branches are named pointers to a snapshot, like git branches. Tags are i
 ALTER TABLE analytics.events CREATE BRANCH dev_2026_05;
 
 -- Pin a known-good snapshot as a tag
-ALTER TABLE analytics.events CREATE TAG release_2026_q2 AS OF VERSION 8472810294;
+ALTER TABLE analytics.events CREATE TAG release_2026_q2 AS OF VERSION 8472810294831234567;
 
 -- Query the branch
 SELECT * FROM analytics.events FOR VERSION AS OF 'dev_2026_05';

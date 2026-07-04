@@ -1,53 +1,87 @@
----
-slug: aws-glue
-title: "AWS Glue Data Catalog"
-description: "Run SQE against the AWS Glue Data Catalog with S3 as storage. A CDK stack bootstraps a throwaway S3 warehouse bucket and tears it down; SQE creates the database and does a full create/write/read round-trip over the AWS SDK."
----
-
 # AWS Glue Data Catalog
 
-Point SQE at the **AWS Glue Data Catalog**. Glue is the catalog (table metadata)
-and S3 is the storage; SQE talks to both over the AWS SDK using your IAM
-credentials. No Polaris, no Keycloak, no local object store.
+## Goal
 
-A small CDK stack bootstraps a throwaway S3 warehouse bucket and tears it down
-at the end, so the quickstart leaves nothing behind in your account.
+Point SQE at the AWS Glue Data Catalog with S3 as storage. Glue is the catalog (table metadata) and S3 is the storage; SQE talks to both over the AWS SDK using your IAM credentials. No Polaris, no Keycloak, no RustFS.
 
-## How it works
+A small CDK stack bootstraps the throwaway S3 warehouse bucket and tears it back down after the run, so the quickstart leaves nothing behind.
 
-- A **TypeScript CDK stack** creates an S3 bucket to use as the Iceberg
-  warehouse. The bucket is removed on CDK destroy (including any Iceberg data
-  inside it).
-- **SQE** uses the `glue` catalog backend, configured with your AWS region and
-  the S3 warehouse path. Both are injected at runtime by `run.sh`.
-- AWS IAM credentials authenticate all Glue catalog and S3 storage operations.
-- SQE creates the Glue database with `CREATE SCHEMA`, making the calling
-  principal its owner. This is deliberate: in a Lake Formation-enabled account, a
-  database created out-of-band is LF-governed with no grants, which blocks
-  `CREATE TABLE`. By creating the database itself, SQE avoids that. See the
-  [glue-lake-formation quickstart](./glue-lake-formation.md) for the governed
-  variant.
-- `run.sh` runs the full loop: CDK deploy → start SQE → run queries → capture
-  output → drop the Glue database → CDK destroy.
+## Components
 
-## What it demonstrates
+| Piece | Role |
+|---|---|
+| `cdk/` (TypeScript) | Creates an S3 warehouse bucket (`cdk deploy`) and removes it (`cdk destroy`). |
+| `docker-compose.yml` | Runs just the SQE coordinator with the glue backend; AWS credentials passed via env. |
+| `sqe.toml` | Annotated config template; `run.sh` fills in the bucket URI and region. |
 
-- SQE connecting to AWS Glue as a non-REST Iceberg catalog with S3 storage.
-- Full create/write/read round-trip: `CREATE SCHEMA` → `CREATE TABLE` →
-  `INSERT` → `SELECT … GROUP BY`, all against live Glue + S3.
-- Clean teardown: the S3 bucket (and all Iceberg data) and the Glue database are
-  removed; no resources left in the account.
+## Configuration
 
-**Status:** validated (2026-06-06).
+### Backend (sqe.toml)
 
-## Run it
+```toml
+[catalog.backend]
+type = "glue"
+region = "__REGION__"
+warehouse = "__WAREHOUSE__"   # s3://<bucket>/ from CDK outputs; run.sh fills this in
 
-Full config, CDK stack, `docker compose`, queries, and captured output are in the repo:
+[storage]
+s3_region = "__REGION__"
+s3_path_style = false
 
-**→ [quickstart/aws-glue/](https://github.com/schubergphilis/sqe/tree/main/quickstart/aws-glue/)**
+[[auth.providers]]
+type = "anonymous"
+user = "anonymous"
+roles = ["admin"]
+```
 
-```bash
-cd quickstart/aws-glue
-cp .env.example .env
-./run.sh
+The glue backend registers under the SQL catalog name `iceberg`, so tables are `iceberg.<glue_database>.<table>`. Auth is the `anonymous` dev provider; Glue authenticates via AWS IAM. For real multi-user auth, put SQE behind Keycloak while the catalog still uses IAM.
+
+### SQL (queries.sql)
+
+```sql
+-- SQE creates the Glue database (makes the caller its owner — Lake Formation safe)
+CREATE SCHEMA IF NOT EXISTS iceberg.sqe_glue_quickstart;
+
+DROP TABLE IF EXISTS iceberg.sqe_glue_quickstart.events;
+CREATE TABLE iceberg.sqe_glue_quickstart.events (
+    id     BIGINT,
+    kind   VARCHAR,
+    amount DOUBLE
+);
+
+INSERT INTO iceberg.sqe_glue_quickstart.events VALUES
+    (1, 'click',    1.50),
+    (2, 'purchase', 42.00),
+    (3, 'click',    0.75),
+    (4, 'purchase', 13.25);
+
+SELECT kind, COUNT(*) AS n, ROUND(SUM(amount), 2) AS total
+FROM iceberg.sqe_glue_quickstart.events
+GROUP BY kind
+ORDER BY total DESC;
+```
+
+## The test
+
+`run.sh` runs the full create/write/read round-trip against a real Glue catalog and S3 bucket. It: deploys the CDK stack (S3 bucket only) → generates `sqe.toml.local` from the stack outputs → starts SQE → executes `queries.sql` (CREATE SCHEMA → CREATE TABLE → INSERT → SELECT) and captures output to `OUTPUT.md` → stops SQE → drops the Glue database → `cdk destroy`.
+
+SQE creates the Glue database via `CREATE SCHEMA` rather than CDK. This is deliberate: in a Lake-Formation-enabled account, a database created out-of-band is LF-governed with no grants, which would deny `CreateTable`. A database SQE creates makes the calling principal its owner, granting the required permissions. This pattern works with or without Lake Formation. The `glue-lake-formation` quickstart explores the governed path instead.
+
+Validated live 2026-06-06 (account `123456789012`, eu-example-1): full round-trip succeeded, teardown left no leftover stack, bucket, or database.
+
+## Output
+
+```
+sqe-cli 0.31.4 connected to http://localhost:50051 (flight)
+(0 rows)
+(0 rows)
+(0 rows)
+(0 rows)
+(2 rows)
++----------+---+-------+
+| kind     | n | total |
++----------+---+-------+
+| purchase | 2 | 55.25 |
+| click    | 2 | 2.25  |
++----------+---+-------+
 ```

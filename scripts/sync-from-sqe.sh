@@ -20,7 +20,7 @@ SQE_DIR="${SQE_DIR:-/Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applica
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-SRC_BOOK="$SQE_DIR/docs/book"
+SRC_BOOK="$SQE_DIR/docs/site/book"
 
 if [ ! -d "$SRC_BOOK" ]; then
   echo "error: source book dir not found: $SRC_BOOK" >&2
@@ -36,6 +36,14 @@ cp "$SRC_BOOK/book.toml" "$REPO_ROOT/book.toml"
 # src/ tree (mirror with delete so removed files do not linger)
 rsync -a --delete "$SRC_BOOK/src/" "$REPO_ROOT/src/"
 
+# Overlay the curated OVERVIEW.md onto each per-quickstart book page (single
+# source of truth). Index + Quack reference pages are left as authored.
+echo "→ overlaying quickstart OVERVIEW pages"
+for ov in "$SQE_DIR"/quickstart/*/OVERVIEW.md; do
+  n="$(basename "$(dirname "$ov")")"
+  [[ -f "$REPO_ROOT/src/quickstart/$n.md" ]] && cp "$ov" "$REPO_ROOT/src/quickstart/$n.md"
+done
+
 # mermaid assets at repo root
 cp "$SRC_BOOK/mermaid.min.js" "$REPO_ROOT/mermaid.min.js"
 cp "$SRC_BOOK/mermaid-init.js" "$REPO_ROOT/mermaid-init.js"
@@ -47,24 +55,18 @@ sed -i '' \
   -e 's#authors = \["VPF Data & AI"\]#authors = ["The SQE Project"]#' \
   "$REPO_ROOT/book.toml"
 
-# --- Sanitize the synced src/ tree (deterministic, re-run safe) -------------
-# Redacts internal detail from the SYNCED COPIES only (source untouched) so the
-# leak gate below passes without hand-edits that the next rsync would clobber.
-# Order matters: the 13+-digit example snapshot-id rule MUST run before the
-# 12-digit account-id rule, or a 19-digit snapshot id gets mangled into
-# "ACCOUNT_ID...". Internal crate paths lose only their `crates/` prefix
-# (smallest diff, keeps useful file refs). The two PUBLIC crates that the gate
-# allowlists — sqe-cli and sqe-coordinator — keep their full `crates/...` path
-# verbatim (e.g. the `cargo install --path crates/sqe-cli` quick-start command
-# must stay correct); they are protected with a sentinel across the strip.
-#
-# These are HEURISTICS, tuned to current source. They prefix-match and
-# over-redact by design (fail safe): `[0-9]{13,}` rewrites ANY 13+-digit number
-# to one fixed example snapshot id; `eu-central`/`eu-west` match any such prefix;
-# the sentinel preserves only the two public crate prefixes. None over-match in
-# today's source — but if a future re-sync mangles something unexpected, this is
-# the first place to look.
-echo "→ sanitizing synced src/ copies"
+# --- Cosmetic normalization of the synced src/ tree (deterministic, re-run safe) -
+# COSMETIC ONLY. Secrets/PII (account ids, personal IAM names, the internal
+# GitLab host, the monorepo path) are now fixed at SOURCE in docs/site/book --
+# the SQE repo's scripts/leak-scan-site.sh enforces that -- so the security
+# redaction rules (incl. the 12-digit account-id rule and its 13+-digit ordering
+# guard) were retired here. What remains is presentation normalization that keeps
+# internal traceability out of the public copies: internal crate paths lose their
+# `crates/` prefix (the public sqe-cli / sqe-coordinator keep theirs via a
+# sentinel), regions/endpoints become placeholders, and MR/branch refs become
+# generic phrasing. (MR/branch rewrites retire once design-note MR refs are
+# backfilled to permalinks.) The leak-scan gate below stays as the publish guard.
+echo "→ normalizing synced src/ copies"
 SANITIZE_FILES=()
 while IFS= read -r -d '' f; do SANITIZE_FILES+=("$f"); done < <(
   find "$REPO_ROOT/src" -type f -name '*.md' -print0
@@ -73,8 +75,6 @@ sed -E -i '' \
   -e 's#crates/(sqe-cli|sqe-coordinator)#@@KEEP@@\1#g' \
   -e 's#crates/(sqe-[a-z-]*)#\1#g' \
   -e 's#@@KEEP@@(sqe-cli|sqe-coordinator)#crates/\1#g' \
-  -e 's#[0-9]{13,}#8472810294#g' \
-  -e 's#[0-9]{12}#ACCOUNT_ID#g' \
   -e 's#eu-central(-[0-9])?#eu-example-1#g' \
   -e 's#eu-west(-[0-9])?#eu-example-2#g' \
   -e 's#amazonaws\.com#aws-endpoint#g' \
@@ -82,11 +82,6 @@ sed -E -i '' \
   -e 's#MR ![0-9]+#an earlier change#g' \
   -e 's#feat/[A-Za-z0-9._-]+#a feature branch#g' \
   -e 's#chore/[A-Za-z0-9._-]+#a maintenance branch#g' \
-  -e 's#https?://sbp\.gitlab\.schubergphilis\.com[A-Za-z0-9._/-]*#https://github.com/schubergphilis/sqe#g' \
-  -e 's#sbp\.gitlab\.schubergphilis\.com#github.com#g' \
-  -e 's#vpf-data-ai/chameleon/applications/sqlengine#schubergphilis/sqe#g' \
-  -e 's#jacobadmin#quickstart-admin#g' \
-  -e 's#jacobbuilder#quickstart-builder#g' \
   "${SANITIZE_FILES[@]}"
 
 # Leak-scan gate over the synced src/ tree.

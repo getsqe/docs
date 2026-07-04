@@ -1,54 +1,104 @@
----
-slug: polaris-keycloak-client-id
-title: "Polaris + Keycloak (client credentials)"
-description: "Run SQE against Apache Polaris with Keycloak as the identity provider. SQE holds a confidential client and exchanges each user's username + password for a bearer token via the OIDC password grant, then passes that token through to Polaris."
----
-
 # Polaris + Keycloak (client credentials)
 
-Run SQE against an Apache Polaris catalog where Keycloak issues the identities.
-A user connects to SQE with a username and password; SQE exchanges those for the
-user's bearer token via its own confidential client (the OIDC Resource Owner
-Password Credentials grant), then passes the token straight through to Polaris.
-Polaris decides what the user can see — no service account, no shared credential.
+## Goal
 
-## How it works
+Run SQE against an Apache Polaris catalog where Keycloak owns the user identities. A client connects to SQE with a username and password; SQE exchanges those credentials for that user's bearer token via its own confidential OIDC client (`sqe-client`), then passes the token through to Polaris. Polaris enforces what each user can see. Every query runs as the authenticated user — no service account, no shared credential.
 
-- **Keycloak** acts as the identity provider. An `iceberg` realm holds a
-  confidential client (`sqe-client`) and three test users with different role
-  levels.
-- **SQE** uses the `oidc_password` auth provider: on login it posts the user's
-  credentials plus its own client secret to Keycloak's token endpoint and
-  receives the user's bearer token.
-- **Polaris** is federated to Keycloak — it validates the token SQE forwards
-  (issuer, signature, audience) and maps the token's `preferred_username` to a
-  Polaris principal with its own RBAC roles.
-- **RustFS** provides S3-compatible warehouse storage. A one-shot `bucket-init`
-  container creates the warehouse bucket on startup.
-- Every query runs as the authenticated user. The user never contacts Keycloak
-  directly.
+Use this quickstart when an OIDC provider already manages your users and you want SQE to mint tokens on their behalf (JDBC tools, the CLI, dbt). If your clients already hold a token and need SQE to accept it directly, see the `polaris-keycloak-user-token` quickstart instead.
 
-## What it demonstrates
+## Components
 
-- SQE minting a user's token from username + password via OIDC password grant.
-- Token passthrough to Polaris: Polaris enforces catalog-level RBAC per principal.
-- Multi-user isolation: `adminuser` (write access) and `testuser` (read-only)
-  running the same queries with different results.
-- Full create/write/read round-trip: `CREATE SCHEMA` → `CREATE TABLE` → `INSERT`
-  → `SELECT … GROUP BY`.
-- Role-level access control validated in two layers: the demo path and the
-  integration test suite.
+| Service | Image | Role |
+|---|---|---|
+| `keycloak` | `quay.io/keycloak/keycloak:26.5.4` | Identity provider. Issues bearer tokens via the OIDC password grant. |
+| `keycloak-config` | `adorsys/keycloak-config-cli` | One-shot: imports the `iceberg` realm (one confidential client, three users), then exits. |
+| `rustfs` | `rustfs/rustfs` | S3-compatible object store. The Iceberg warehouse lives here. |
+| `bucket-init` | `amazon/aws-cli` | One-shot: creates the `warehouse` bucket (RustFS does not auto-create), then exits. |
+| `polaris` | `apache/polaris:1.5.0` | Iceberg REST catalog, federated to Keycloak. Validates the tokens SQE forwards. |
+| `polaris-setup` | `curlimages/curl` | One-shot: creates the catalog, RBAC roles, OIDC principals, and the `demo` namespace, then exits. |
+| `sqe` | built from this repo | The query engine. Flight SQL on 50051, Trino-compat HTTP on 8080. |
 
-**Status:** validated (2026-06-06).
+## Configuration
 
-## Run it
+### Backend (sqe.toml)
 
-Full config, `docker compose`, queries, and captured output are in the repo:
+```toml
+[[auth.providers]]
+type = "oidc_password"
+token_url = "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token"
+client_id = "sqe-client"
+client_secret = "sqe-secret-change-me"   # must match Keycloak's sqe-client secret
+roles_claim = "realm_access.roles"        # where SQE reads the user's roles
 
-**→ [quickstart/polaris-keycloak-client-id/](https://github.com/schubergphilis/sqe/tree/main/quickstart/polaris-keycloak-client-id/)**
+[catalogs.quickstart]
+polaris_url = "http://polaris:8181/api/catalog"
+warehouse = "quickstart"
 
-```bash
-cd quickstart/polaris-keycloak-client-id
-cp .env.example .env
-./run.sh
+[storage]
+s3_endpoint = "http://rustfs:9000"
+s3_access_key = "s3admin"
+s3_secret_key = "s3adminpw"
+s3_path_style = true
+s3_allow_http = true
+```
+
+`type = "oidc_password"` selects the Resource Owner Password Credentials (ROPC) grant. SQE posts the user's `username` + `password` plus its own `client_id` + `client_secret` to `token_url` and gets back the user's bearer token, which is forwarded to Polaris. The TOML key `quickstart` becomes the SQL catalog name, so tables are addressed as `quickstart.<namespace>.<table>`.
+
+### SQL (queries.sql)
+
+```sql
+SHOW SCHEMAS;
+
+DROP TABLE IF EXISTS quickstart.demo.events;
+CREATE TABLE quickstart.demo.events (
+    id     BIGINT,
+    kind   VARCHAR,
+    amount DOUBLE
+);
+
+INSERT INTO quickstart.demo.events VALUES
+    (1, 'click',    1.50),
+    (2, 'purchase', 42.00),
+    (3, 'click',    0.75),
+    (4, 'purchase', 13.25);
+
+SELECT kind, COUNT(*) AS n, ROUND(SUM(amount), 2) AS total
+FROM quickstart.demo.events
+GROUP BY kind
+ORDER BY total DESC;
+```
+
+## The test
+
+`run.sh` brings the full stack up with `docker compose up --wait`, then runs `queries.sql` twice via `sqe-cli` over Flight SQL — once as `adminuser` (catalog_admin + data_writer + table_reader) to exercise the complete create/write/read path, and once as `testuser` (table_reader only) to confirm that a lower-privileged user can read the table written by adminuser. Success is asserted by `--stop-on-error`; the output is captured to `OUTPUT.md`.
+
+An optional `--with-tests` flag additionally runs the `test_keycloak_auth_with_test_users` and `test_keycloak_token_refresh` tests in the `sqe-coordinator` integration suite against the live stack (requires a Rust toolchain). Both tests passed on last validation (2026-06-06, 2 passed; 0 failed). Tear down with `./run.sh --down`.
+
+## Output
+
+```
+## adminuser (catalog_admin + data_writer + table_reader)
+
+sqe-cli 0.31.4 connected to http://localhost:50051 (flight)
++-------------+
+| schema_name |
++-------------+
+| demo        |
++-------------+
++----------+---+-------+
+| kind     | n | total |
++----------+---+-------+
+| purchase | 2 | 55.25 |
+| click    | 2 | 2.25  |
++----------+---+-------+
+
+## testuser (table_reader only): read is allowed
+
+sqe-cli 0.31.4 connected to http://localhost:50051 (flight)
++----------+---+
+| kind     | n |
++----------+---+
+| click    | 2 |
+| purchase | 2 |
++----------+---+
 ```

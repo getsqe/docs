@@ -29,7 +29,7 @@ Source: `sqe-sql/src/time_travel.rs`, `crates/sqe-coordinator/src/{query_handler
 
 ```sql
 -- By snapshot id
-SELECT * FROM events FOR VERSION AS OF 8472810294;
+SELECT * FROM events FOR VERSION AS OF 8472810294831234567;
 
 -- By branch
 SELECT * FROM events FOR VERSION AS OF 'dev_2026_05';
