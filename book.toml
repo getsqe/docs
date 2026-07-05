@@ -11,7 +11,7 @@ build-dir = "./book"
 default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/getsqe/docs"
-additional-css = []
+additional-css = ["sqe-theme.css"]
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
 [preprocessor.mermaid]
