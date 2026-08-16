@@ -114,6 +114,52 @@ Files are split at 128 MB for parallelism. Output is structured as:
         └── ... (8 tables total)
 ```
 
+## Direct-to-Iceberg Sink
+
+`generate --sink iceberg` skips the staging Parquet step entirely. Instead of
+writing files to `--output` for a later `load` run, it connects straight to
+the Iceberg REST catalog, creates the tables, and commits data files with one
+`fast_append` per table. The sink works for every generator benchmark (TPC-H,
+TPC-DS, SSB, TPC-C, TPC-E, TPC-BB, ClickBench, and bank), not just the bank
+demo schema that introduced the sink.
+
+```bash
+cargo run -p sqe-bench -- generate tpch --scale 10 --sink iceberg \
+  --catalog-uri http://localhost:8181/api/catalog \
+  --warehouse bench --namespace tpch \
+  --client-id ... --client-secret ...
+```
+
+The command creates the namespace if it does not exist, then generates and
+commits each table in turn. Data is written in parallel shards for TPC-H and
+bank; the other generators write one shard per table.
+
+The sink buffers one full generation shard in memory before writing it, so
+peak memory scales with shard size: per-table for the serial generators, per
+`rows / --threads` for TPC-H and bank. At large scales, raise `--threads` to
+shrink each shard, or fall back to the parquet staging path (`generate` then
+`load`) if memory stays tight.
+
+Two flags control repeated runs against the same namespace:
+
+- `--resume` skips a table that already carries a
+  `sqe-bench.table.<name>=done` property, so an interrupted or repeated
+  `generate` run does not redo work or duplicate rows. The marker is set on
+  the table itself, not derived from snapshot history, because some
+  catalogs serve a trimmed snapshot list.
+- `--clean` drops and recreates every table first, so the run is idempotent
+  regardless of what state the namespace was in. `--clean` and `--resume`
+  are mutually exclusive.
+
+Without `--resume` or `--clean`, re-running `generate` against a table that
+already holds data commits another `fast_append` on top of it, duplicating
+every row. The done marker is only consulted when you pass `--resume`.
+
+Catalog and storage settings match the `load` command's `--s3-*` flags, plus
+the catalog's OAuth2 client-credentials pair (`--client-id`/`--client-secret`)
+or a pre-acquired `--bearer-token`. See `sqe-bench generate --help` for the
+full flag list.
+
 ## Loading Data
 
 The `load` command connects to SQE and creates Iceberg tables using `read_parquet()` + CTAS. No intermediate format conversion is needed. Parquet files are read directly and written as Iceberg.
@@ -175,6 +221,48 @@ SELECT * FROM read_parquet(
 ```
 
 See [read_parquet TVF](./read-parquet.md) for full syntax documentation.
+
+## Fast benchmark runs via attached golden tables
+
+For the read-only suites (`tpch`, `ssb`, `tpcds`, `clickbench`), the load step dominates wall-clock time and adds nothing to the query measurement: every run rewrites the same parquet into fresh Iceberg tables before a single query runs. Publish those tables once into a persistent Polaris, then attach them read-only on every subsequent run instead of reloading.
+
+Publish once:
+
+```bash
+BENCH_GOLDEN_POLARIS_URL=https://polaris.example.com/api/catalog \
+BENCH_GOLDEN_WAREHOUSE=golden_warehouse \
+BENCH_GOLDEN_TOKEN=<bearer> \
+BENCH_S3_ENDPOINT=https://s3.example.com \
+BENCH_GOLDEN_S3_ACCESS_KEY=... BENCH_GOLDEN_S3_SECRET_KEY=... \
+BENCH_SCALE=1 ./scripts/benchmark-publish-iceberg.sh
+```
+
+Then run any read-only suite with `BENCH_DATA_SOURCE=attach`:
+
+```bash
+BENCH_GOLDEN_POLARIS_URL=https://polaris.example.com/api/catalog \
+BENCH_GOLDEN_WAREHOUSE=golden_warehouse \
+BENCH_GOLDEN_TOKEN=<bearer> \
+BENCH_S3_ENDPOINT=https://s3.example.com \
+BENCH_GOLDEN_S3_ACCESS_KEY=... BENCH_GOLDEN_S3_SECRET_KEY=... \
+BENCH_DATA_SOURCE=attach BENCH_SCALE=1 ./scripts/benchmark-test.sh tpch
+```
+
+`benchmark-test.sh` attaches the golden catalog once (`scripts/benchmark-attach-golden.sh`) and queries each table as `golden.<namespace>.<table>` instead of generating and loading data. `tpcc` and `tpce` are write suites (their queries include DELETE/UPDATE via CoW), so they still generate and load normally even in attach mode; a shallow-clone path that would let them run against golden tables too, without mutating the shared copy, is planned but not yet built. `bank` and `tpcbb` also still generate and load normally in attach mode: `bank` is published to golden by `benchmark-publish-iceberg.sh`, but attach mode does not yet query it from there, and `tpcbb`'s own tables (`web_clickstreams`, `product_reviews`) are not published at all, since `tpcbb` shares `tpcds`'s namespace and only needs the two tables it adds. Wiring bank/tpcbb into attach mode is the deferred follow-up alongside the tpcc/tpce shallow-clone path. Attach is loud by design: a missing or unreachable golden catalog fails the run with the ATTACH error rather than silently falling back to a full load, which would mask the exact cost this path removes.
+
+## Unified harness (benchmark.sh + sqe-bench run)
+
+For the read-only suites (tpch, ssb, tpcds, clickbench), the unified harness combines data attachment with query execution in one command:
+
+```bash
+BENCH_PROFILE=local BENCH_SCALE=1 scripts/benchmark.sh tpch ssb tpcds clickbench
+```
+
+The `scripts/benchmark.sh` orchestrates two steps. First, it attaches the golden Iceberg catalog (published once via `benchmark-publish-iceberg.sh`). Second, it runs the suites through `sqe-bench run`, which executes all queries against the attached tables and emits JSON reports to `benchmarks/results/`.
+
+Configuration profiles live in `benchmarks/profiles/<name>.toml`. Profiles define the coordinator config, catalog credentials, and suite-specific settings. Credentials come from environment variables or AWS profiles, never stored in the TOML file itself. The profile loader redacts secrets on error and checks for committed keys at startup.
+
+Each read-only suite attaches golden (zero load); write suites (tpcc, tpce) are a follow-up plan. The old `benchmark-*.sh` scripts remain: the migration to unified is a later commit after parity is confirmed.
 
 ## Running Tests
 
@@ -380,7 +468,7 @@ pub trait BenchmarkGenerator {
 pub struct TableDef {
     pub name: String,
     pub schema: Arc<Schema>,             // Arrow schema
-    pub row_count_fn: fn(f64) -> usize,  // scale factor → row count
+    pub row_count_fn: fn(f64) -> usize,  // scale factor to row count
 }
 ```
 

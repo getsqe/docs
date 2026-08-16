@@ -6,18 +6,18 @@ by rewriting the query plan. It is separate from the catalog access-control path
 
 For the coarse, catalog-level path (where SQE translates `GRANT`/`REVOKE` into
 Ranger policies on the `polaris` service and Polaris enforces them, and SQE does
-no filtering of its own) see `docs/ranger-access-control.md`. That document is the
+no filtering of its own) see [ranger-access-control.md](./ranger-access-control.md). That document is the
 companion to this one. This document does not repeat it.
 
 ## Overview
 
 The two paths use two different Ranger services and two different config blocks.
 
-- **Catalog path** (`docs/ranger-access-control.md`). `[access_control] backend
+- **Catalog path** ([ranger-access-control.md](./ranger-access-control.md)). `[access_control] backend
   = "ranger"`. SQE writes the `polaris` service; Polaris enforces. Coarse
   allow/deny per catalog operation. SQE does not filter rows or mask columns.
 - **Fine-grained path** (this document). `[policy] engine = "ranger"`. SQE reads
-  the `hive` service-def, the same service Apache Spark's Kyuubi Ranger plugin
+  the `query` service-def, the same service Apache Spark's Kyuubi Ranger plugin
   reads, and enforces row filters and column masks in its own `LogicalPlan`
   rewriter, between planning and optimization.
 
@@ -31,8 +31,8 @@ Why this lives in SQE and not Polaris: the `polaris` service-def declares no
 boolean allow/deny. It cannot enforce row filters or column masks even though the
 Ranger engine can compute them. Fine-grained enforcement has to happen in the
 query engine. The full service-type rationale is in
-`docs/ranger-fine-grained-service-type.md`; the design notes are in
-`docs/fine-grained-policy.md`.
+[ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md); the design notes are in
+[fine-grained-policy.md](./fine-grained-policy.md).
 
 ## How it works
 
@@ -44,6 +44,19 @@ Ranger Admin  --download bundle-->  RangerStore (resolve)  -->  ResolvedPolicy
 ResolvedPolicy  -->  PolicyPlanRewriter  -->  rewritten LogicalPlan  -->  optimizer
 ```
 
+### Namespace matching and the last-component fallback
+
+`resolve` is keyed on the full dotted Iceberg namespace. A Ranger policy
+whose `database` resource is only the last component (`finance`) still
+matches `tenant_a.finance` and `tenant_b.finance`. That is a migration
+path from the old last-component lookup key, not the intended convention.
+
+Over-matching is the safe direction for a mask or row filter: the policy
+keeps firing instead of silently disappearing. The cost is tenant
+collision. Two namespaces that share a last component cannot tell those
+policies apart. Rewrite the Ranger `database` value as the full dotted
+namespace (the same key Kyuubi uses) and the fallback no longer applies.
+
 ### Download bundle
 
 `RangerStore::fetch_bundle` calls one endpoint:
@@ -52,7 +65,7 @@ ResolvedPolicy  -->  PolicyPlanRewriter  -->  rewritten LogicalPlan  -->  optimi
 GET /service/plugins/policies/download/{service_name}
 ```
 
-The `{service_name}` is `hive` by default (config `policy.ranger.service-name`).
+The `{service_name}` is `hive` by default (config `policy.ranger.service-name`); the quickstarts set it to `query`.
 The call uses HTTP basic auth with the configured admin user and password. The
 response is the full `ServicePolicies` JSON bundle: the resource `policies[]`
 (each carries a `policyType`: 0 = access, 1 = DATAMASK, 2 = ROWFILTER), and an
@@ -60,6 +73,15 @@ optional nested `tagPolicies` block when a `tag` service is linked. This is the
 same bundle the JVM Ranger plugin downloads, which is why the policy set is shared
 with Spark/Kyuubi. The public-v2 `/api/policy` endpoint returns a flat
 resource-only array and is insufficient.
+
+The bundle and the per-user `ResolvedPolicy` cache share
+`policy.ranger.cache_ttl_secs` (default 30s). `GRANT` / `REVOKE` / policy
+DDL through SQE call `invalidate_policy_cache()`, so the next query sees
+the edit. Edits made in Ranger Admin behind SQE's back wait until the
+bundle TTL expires. When that download reports a new `policyVersion`,
+the resolved-policy cache is dropped too, so the Admin edit is visible
+on the next resolve instead of waiting out a second 30s. Operators who
+need the change sooner can hit the admin catalog-refresh hook.
 
 ### Resolve
 
@@ -98,6 +120,10 @@ expressions normalize against the real (qualified) scan schema:
 
 1. **Row filters** inject as `Filter` nodes above the `TableScan`. User
    predicates can push through these (same semantics as a user `WHERE`).
+   The filter sits *below* the masking projection, so it is evaluated against
+   stored values: masking a column that a row filter reads does not change which
+   rows survive. Kyuubi orders these two the other way around, which is why
+   `scripts/access-control-parity-demo.sh` pins the difference.
 2. **Column masks** replace the column reference in a projection with the masking
    expression, aliased back to the column's qualified name. User predicates
    cannot push through a mask expression (the expression boundary blocks
@@ -212,7 +238,7 @@ all five resolve fully. This is the documented MVP behavior.
 ## Tag-based masking
 
 Tag-based masking splits into two independently-stored halves. The decision is
-recorded in `docs/ranger-tag-storage-decision.md`.
+recorded in [Ranger tag storage](./ranger-tag-storage-decision.md).
 
 1. **The mask-per-tag RULE** ("any column tagged `PII` is masked show-last-4")
    lives in Apache Ranger as a `tag`-service policy, returned in the download
@@ -237,6 +263,69 @@ ALTER TABLE sales.orders UNSET TAGS (salary);
 Snowflake's column-tag syntax works too. The tag name becomes the label; SQE has
 no tag values, so the assigned value is ignored. `ALTER COLUMN` is accepted as a
 synonym for `MODIFY COLUMN`.
+
+### Authoring the tag policy: mask types carry a component prefix
+
+A `tag`-service policy must name the mask type in component-qualified form:
+
+```json
+"dataMaskInfo": { "dataMaskType": "hive:MASK_SHOW_LAST_4" }
+```
+
+Ranger's `tag` service definition does not define bare mask names. It aggregates
+the mask types of every component it can decorate, so its `dataMaskDef` lists
+`hive:MASK_SHOW_LAST_4`, `hive:CUSTOM`, `trino:MASK_NULL` and so on. Ranger
+rejects a policy naming a bare type with HTTP 400.
+
+SQE reads a `hive`-type service, so `map_mask` normalizes the `hive:` prefix and
+accepts either form. Another component's prefix is deliberately left unmatched,
+which restricts the tagged column rather than applying a foreign engine's
+policy.
+
+This mattered in practice. Until 2026-07-31 the mapper matched bare names only,
+so every tag mask fell through to the unsupported arm and the tagged column was
+RESTRICTED instead of masked. Fail-closed, so no value ever leaked, but the
+feature was inert from the day it shipped. Nothing caught it because the
+harness of the day asserted the absence of raw digits, and a restricted column
+has no digits either. The regression test is
+`mask_type_component_prefix_is_normalized` plus the live-Ranger case
+`tag_column_mask_applies_from_iceberg_property`.
+
+### Tag row filters need a Ranger Admin property
+
+A `tag`-service policy can carry a row filter as well as a mask (policyType 2 on
+the tag service), so one rule filters every table holding a column with the tag.
+SQE supports it, and Ranger ships the capability switched off:
+
+```xml
+<property>
+  <name>ranger.servicedef.autopropagate.rowfilterdef.to.tag</name>
+  <value>true</value>
+</property>
+```
+
+in `ranger-admin-site.xml`. Ranger copies each component's `dataMaskDef` into the
+tag service definition unconditionally, but copies its `rowFilterDef` only when
+that property is true (`AbstractServiceStore`, default `false`). This is not a
+version limitation and no upgrade changes it.
+
+Without the property the tag service definition carries a populated
+`dataMaskDef` and an empty `rowFilterDef`, and the policy POST is rejected with
+
+```
+tag policy can specify values for one of the following resource sets:
+ does not have any resource hierarchies
+```
+
+The message names resource hierarchies rather than the missing capability, so it
+reads like a malformed resource block. It is not: the resource block is fine and
+the definition simply cannot express a row filter.
+
+One caveat if you patch the definition over REST rather than setting the
+property: Ranger's own aggregate `tag` definition does not round-trip through
+Ranger's validator. It carries a duplicate `ozone:assume_role` access type and
+elasticsearch implied grants naming access types the definition never declares,
+both of which must be pruned before the PUT is accepted.
 
 ```sql
 ALTER TABLE sales.orders MODIFY COLUMN email SET TAG PII = 'true';
@@ -269,7 +358,7 @@ Tags as table properties (rather than the Ranger tag store) win on four counts:
 they cover federated catalogs that Polaris cannot gate, they need no Atlas/tagsync
 deployment, they travel with the data through clone/replicate/rename, and SQE
 already reads `table.metadata()` on every scan. The full rationale is in
-`docs/ranger-tag-storage-decision.md`.
+[ranger-tag-storage-decision.md](./ranger-tag-storage-decision.md).
 
 ### Resolution and merge
 
@@ -293,9 +382,14 @@ returns a three-tuple:
 locked precedence contract:
 
 1. **Restricted columns always win.** A tag cannot un-restrict a column.
-2. **Resource masks win over tag masks.** A column already carrying a mask from
-   `resolve()` keeps it; a tag mask does not overwrite it. A resource mask is
-   sufficient protection, so an unmappable tag does not also restrict it.
+2. **Tag masks win over resource masks, by default.** `policy.mask-precedence`
+   selects this: `tag` (the default) matches the standard Ranger plugin order
+   that Hive and Spark/Kyuubi implement, so one policy set renders one value in
+   every engine. `resource` keeps the narrower most-specific-rule-wins reading
+   SQE shipped earlier. Either way the column is masked, and either way an
+   unmappable tag never strips or restricts a column that already has a working
+   resource mask: replacing a readable masked value with NULL is not an
+   improvement.
 3. **Tag row filters are ANDed with resource row filters** (most restrictive).
 4. **Within a column, the first tag in stored order with a matching mask wins**
    (deterministic, since `col_tags` preserves the parsed JSON order).
@@ -315,15 +409,35 @@ There are three authoring surfaces, one per layer.
 
 - **Coarse catalog layer.** SQL `GRANT` / `REVOKE`. The access-control backend
   writes the `polaris` Ranger service; Polaris enforces. See
-  `docs/ranger-access-control.md`.
-- **Fine-grained row filters and column masks.** Authored as policies on the
-  `hive` Ranger service (row-filter policyType 2, data-mask policyType 1),
-  through the Ranger Admin UI or REST. SQE downloads and enforces them. The same
-  policies enforce in Spark/Kyuubi.
+  [Ranger access control](./ranger-access-control.md).
+- **Fine-grained row filters and column masks.** SQL `CREATE OR REPLACE POLICY`
+  / `DROP POLICY` writes the `hive` Ranger service (row-filter policyType 2,
+  data-mask policyType 1). SQE downloads and enforces them. The same policies
+  enforce in Spark/Kyuubi. Ranger UI/REST remains an external authoring path.
 - **Tag-to-column associations.** `ALTER TABLE ... SET TAGS / UNSET TAGS` (the
   Snowflake `MODIFY|ALTER COLUMN ... SET TAG` forms work too). The DDL writes the
   `sqe.column-tags` table property. The mask-per-tag rule itself is a `hive`/`tag`
   service policy in Ranger.
+
+### Propagation delay, per surface
+
+The SQL surfaces take effect immediately: `GRANT`, `REVOKE`, policy DDL and
+`SET TAGS` / `UNSET TAGS` flush the resolved-policy cache after the mutation
+commits, so the next query re-resolves (issue #207).
+
+A policy authored in the Ranger UI or over REST does not, because SQE learns
+about it only on the next download. The resolved-policy cache holds for
+`[policy.ranger] cache-ttl-secs`, which bounds an over-permissive window: a user
+who queried the table before the edit keeps the old decision until their cache
+entry expires. Tightening a mask in the console is therefore eventually
+consistent, up to the TTL.
+
+The tag path is exempt on the association side, since `resolve_tags` re-reads the
+column-to-tag map on every call. The tag RULE still comes from the cached bundle.
+
+Lower `cache-ttl-secs` if prompt propagation of console-authored edits matters
+more than download load against Ranger Admin. The window is pinned at both edges
+by `cache_ttl_bounds_policy_staleness`.
 
 ## Catalog path vs fine-grained path
 
@@ -332,12 +446,12 @@ There are three authoring surfaces, one per layer.
 | Config block | `[access_control] backend = "ranger"` | `[policy] engine = "ranger"` |
 | Ranger service | `polaris` | `hive` (+ linked `tag`) |
 | Granularity | catalog / namespace / table allow-deny | row filters, column masks, restricted columns, tag masks |
-| Authored via | SQL `GRANT` / `REVOKE` | Ranger UI/REST + `ALTER TABLE SET TAGS` for tags |
+| Authored via | SQL `GRANT` / `REVOKE` | SQL `CREATE/DROP POLICY` + `ALTER TABLE SET TAGS` (Ranger UI/REST also supported) |
 | Enforced by | Polaris embedded authorizer | SQE `PolicyPlanRewriter` (plan rewrite) |
 | Does SQE filter? | No (write/read policies only) | Yes (rewrites the plan) |
-| Shared with Spark? | No (Polaris-specific service) | Yes (the `hive` service Kyuubi reads) |
+| Shared with Spark? | No (Polaris-specific service) | Yes (the `query` service Kyuubi reads) |
 | Identity matching | Ranger role membership (resolved by Polaris) | token roles, matched directly |
-| Document | `docs/ranger-access-control.md` | this document |
+| Document | [ranger-access-control.md](./ranger-access-control.md) | this document |
 
 Both gates apply to every query. The catalog gate runs first at Polaris; the
 fine-grained rewrite runs in SQE on the loaded plan.
@@ -353,7 +467,7 @@ engine = "ranger"
 
 [policy.ranger]
 url = "http://ranger-admin:6080"
-service-name = "hive"
+service-name = "query"
 admin-user = "admin"
 # Set via SQE_POLICY__RANGER__ADMIN_PASSWORD rather than in the file.
 admin-password = ""
@@ -369,7 +483,7 @@ Field reference (`RangerPolicyConfig` in `sqe-core/src/config.rs`):
 |---|---|---|
 | `policy.engine` | policy backend selector; `ranger` activates this path | `passthrough` |
 | `policy.ranger.url` | Ranger Admin base URL | (empty) |
-| `service-name` | the `hive` Ranger service to read; shared with Spark/Kyuubi | `hive` |
+| `service-name` | the frontend-query Ranger instance to read; shared with Spark/Kyuubi | `hive` |
 | `admin-user` | Ranger Admin user for HTTP basic auth | `admin` |
 | `admin-password` | Ranger Admin password (a secret) | (empty) |
 | `timeout-secs` | HTTP timeout for one download call | `5` |
@@ -381,7 +495,7 @@ Field reference (`RangerPolicyConfig` in `sqe-core/src/config.rs`):
 
 The two Ranger config blocks are distinct. `[access_control.ranger]` points at
 the `polaris` service for the write/enforce-at-Polaris catalog path.
-`[policy.ranger]` points at the `hive` service for the SQE-side fine-grained
+`[policy.ranger]` points at the `query` service for the SQE-side fine-grained
 path. They can target the same Ranger Admin host but read different services.
 
 ## Quickstart and related docs
@@ -393,18 +507,18 @@ live setup, and `test.sh` section 5 proves a `MASK_NULL` on `orders.amount` and 
 `xxx-xx-1111` and an empty amount; alice (analyst-only) sees the raw values.
 
 For cross-engine parity with Apache Spark on the same Ranger setup, see
-`docs/sqe-spark-ranger-parity.md`.
+[sqe-spark-ranger-parity.md](./sqe-spark-ranger-parity.md).
 
 Related references:
 
-- `docs/ranger-access-control.md` -- the catalog access-control path (companion).
-- `docs/ranger-fine-grained-service-type.md` -- why the `hive` service-def, the
+- [ranger-access-control.md](./ranger-access-control.md) -- the catalog access-control path (companion).
+- [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) -- why the `query` service-def, the
   flattening sharp edge, cross-engine requirements.
-- `docs/ranger-tag-storage-decision.md` -- where tag associations are stored.
-- `docs/fine-grained-policy.md` -- design notes and Snowflake-parity mapping.
+- [ranger-tag-storage-decision.md](./ranger-tag-storage-decision.md) -- where tag associations are stored.
+- [fine-grained-policy.md](./fine-grained-policy.md) -- design notes and Snowflake-parity mapping.
 
 ## Versions
 
-- Apache Polaris 1.5.0 (embedded Ranger authorizer, Beta).
+- Apache Polaris 1.7.0 (embedded Ranger authorizer, Beta).
 - Apache Ranger 2.8.0.
 - Keycloak 26.5.

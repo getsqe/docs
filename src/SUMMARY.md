@@ -32,6 +32,11 @@
 - [Custom SQL Extensions](./features/custom-sql.md)
 - [Iceberg Integration](./features/iceberg.md)
 - [Write Path](./features/write-path.md)
+- [Autonomous Compaction](./features/autonomous-compaction.md)
+- [Access control tutorial (Polaris gate + SQE row/column/mask/tags)](./features/access-control-tutorial.md)
+- [Fine-grained access control (row filters, masking)](./features/fine-grained-access-control.md)
+- [Access control: support matrix](./features/access-control-matrix.md)
+- [Access control: evaluation order, engine by engine](./features/access-control-evaluation-order.md)
 - [read\_parquet TVF](./features/read-parquet.md)
 - [File-format TVFs (read\_csv / read\_json / read\_delta)](./features/file-format-tvfs.md)
 - [Observability](./features/observability.md)
@@ -91,6 +96,8 @@
 - [Overview](./quickstart/index.md)
 - [Polaris + Keycloak (client credentials)](./quickstart/polaris-keycloak-client-id.md)
 - [Polaris + Keycloak (user token)](./quickstart/polaris-keycloak-user-token.md)
+- [Polaris + Ranger + Keycloak (fine-grained masking + Spark parity)](./quickstart/polaris-ranger-keycloak.md)
+- [Polaris + Ranger (service principal)](./quickstart/polaris-ranger-service-principal.md)
 - [Project Nessie (Iceberg REST catalog)](./quickstart/nessie.md)
 - [Unity Catalog OSS (Iceberg REST, read-only)](./quickstart/unity-oss.md)
 - [AWS S3 Tables (managed Iceberg)](./quickstart/aws-s3-tables.md)
@@ -102,8 +109,10 @@
 - [Quack: the DuckDB wire protocol](./quickstart/quack.md)
   - [Quack protocol reference](./quickstart/quack-protocol.md)
   - [Quack data-type matrix](./quickstart/quack-datatype-matrix.md)
+- [Connect BI tools (Metabase, Superset, DBeaver)](./quickstart/bi-tools.md)
 - [Observability: metrics + Grafana](./quickstart/observability.md)
 - [Benchmarks: TPC-H / TPC-DS / SSB](./quickstart/benchmark.md)
+- [Distributed: coordinator + workers](./quickstart/distributed.md)
 
 ---
 
@@ -123,6 +132,7 @@
 - [Audit Logging (OCSF)](./operations/audit-logging.md)
 - [Web UI](./operations/web-ui.md)
 - [On-Call Runbook](./operations/runbook.md)
+- [Production guide (scaling phases)](./operations/production-guide.md)
 
 ---
 
@@ -152,6 +162,7 @@
 - [Iceberg Caching Strategy](./design-notes/iceberg-caching-strategy.md)
 - [Change Data Capture](./design-notes/cdc.md)
 - [Merge-on-Read vs Copy-on-Write](./design-notes/mor-vs-cow.md)
+- [Distributed Compaction](./design-notes/distributed-compaction.md)
 - [Runtime Filter Pushdown](./design-notes/runtime-filter-pushdown.md)
 - [SSB SF1 Trace](./design-notes/ssb-sf1-trace.md)
 - [Quack Protocol](./design-notes/quack-protocol.md)

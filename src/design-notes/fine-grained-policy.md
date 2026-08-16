@@ -4,7 +4,7 @@ Future phase, not yet built. Design notes for row-level filtering, column
 masking, and tag-based masking in SQE, driven by Apache Ranger, reaching rough
 parity with Snowflake's row-access + masking + tag-masking. Pairs with the
 coarse Ranger access-control backend already shipped (catalog/table allow-deny
-via Polaris) and with `docs/s3vending.md`.
+via Polaris) and with `docs/site/book/src/design-notes/s3vending.md`.
 
 ## Why this lives in SQE, not Polaris
 
@@ -31,7 +31,7 @@ SQE should keep pull/rewrite. The work is not the model (it exists) but the
 policy VOCABULARY to express Snowflake-equivalent policies, plus a Ranger-backed
 policy source.
 
-## Which Ranger service-def (authoritative: `docs/ranger-fine-grained-service-type.md`)
+## Which Ranger service-def (authoritative: [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md))
 
 Fine-grained policies do NOT go on the `polaris` service (it has no
 `dataMaskDef`/`rowFilterDef` - coarse allow/deny only). Use the **`hive`
@@ -123,12 +123,12 @@ and SQE's fine-grained rewriter (new `RangerStore: PolicyStore`).
   order: tag policies first, deny-overrides, then resource access -> mask ->
   row-filter. Translate `filterExpr`/`valueExpr` from Hive/Spark dialect to
   DataFusion; realize Hive mask transformers as DataFusion UDFs (see the mask
-  table in `docs/ranger-fine-grained-service-type.md`).
+  table in [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md)).
 - Wire it as a `PolicyEngine::Ranger` variant in config, feeding the existing
   `PolicyEnforcer` / `PlanRewriter` (which today runs passthrough).
 - Cache + fail-closed like `OpaStore` (use `policyVersion` for incremental refresh).
 
-See `docs/ranger-fine-grained-service-type.md` for the full service-type
+See [ranger-fine-grained-service-type.md](./ranger-fine-grained-service-type.md) for the full service-type
 rationale, the mask-type mapping, the flattening sharp edge, and cross-engine
 sharing requirements.
 
@@ -161,8 +161,8 @@ vocabulary is implemented and wired. Steps 3, 4, and 6 from the original list ar
 
 - `TagSource` trait + `NoopTagSource` default + `CacheTagSource` production implementation. Tags stored as Iceberg `sqe.column-tags` table property.
 - `PolicyStore::resolve_tags` default no-op; `RangerStore` overrides to fetch `tagPolicies` from the Ranger bundle and return `(tag_masks_by_tag, tag_filters, unmappable_tags)`.
-- `PolicyPlanRewriter` wired: calls `tag_source.column_tags(catalog, full-namespace-vec, table)` using the FULL namespace path (not last component), then `resolve_tags`, then `merge_tag_masks`. Precedence rules: resource mask wins, restricted stays restricted, unmappable tag fails closed.
-- Four executable integration tests prove: tag mask end-to-end, full-namespace identity (FakeTagSource capture), resource-mask-wins precedence, unmappable-tag fail-closed.
+- `PolicyPlanRewriter` wired: calls `tag_source.column_tags(catalog, full-namespace-vec, table)` using the FULL namespace path (not last component), then `resolve_tags`, then `merge_tag_masks`. Precedence rules: `policy.mask-precedence` picks the contested-column winner (default `tag`, matching Spark/Kyuubi; `resource` for most-specific-wins), restricted stays restricted, unmappable tag fails closed unless a working resource mask is already in place.
+- Four executable integration tests prove: tag mask end-to-end, full-namespace identity (FakeTagSource capture), contested-column precedence in both modes, unmappable-tag fail-closed.
 - NOT live-demoed (quickstart stack drift); the executable tests are the proof.
 - Phase 3b (shipped): CUSTOM tag masks + cache invalidation on `SET TBLPROPERTIES`.
 
