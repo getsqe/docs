@@ -28,7 +28,8 @@ live testing. The mapping has two halves: users and roles, handled differently.
 **Users (principals).** Polaris federates the principal from the Keycloak token:
 the principal name is `preferred_username`. But federation RESOLVES an existing
 principal entity; it does not create one. So each user must be pre-created as a
-Polaris principal (the data bootstrap creates `alice`, `bob`, `carol`, `dave`).
+Polaris principal (the data bootstrap creates `alice`, `bob`, `carol`, `dave`, `erin`,
+`frank`).
 A token for a principal that does not exist is rejected with 401 "Failed to
 resolve principal". Polaris sends this principal name to Ranger as the `user`.
 
@@ -134,11 +135,11 @@ Resolved value for this stack: `"*"` (root required, wildcard-matched).
 ## Fine-grained enforcement (SQE-side)
 
 The Polaris gate tested above is coarse: it answers "may this user load this table?" SQE also
-enforces row filters and column masks at the query-plan layer, reading a separate `hive`-type
+enforces row filters and column masks at the query-plan layer, reading a separate `hive`-servicedef
 Ranger service. These two paths are independent.
 
-**How SQE reads the hive service.** On startup (and on a configurable refresh interval) SQE
-calls `GET /service/plugins/policies/download/hive` to download the policy set. The
+**How SQE reads the query service.** On startup (and on a configurable refresh interval) SQE
+calls `GET /service/plugins/policies/download/query` to download the policy set. The
 `[policy] engine = "ranger"` setting activates the `RangerStore: PolicyStore`, which caches
 these policies and evaluates them against each query's catalog, namespace, and table.
 
@@ -154,12 +155,12 @@ resource. For `sales_wh.sales.orders` the resource sent to Ranger is `database =
 three-part path `"sales_wh.sales"`.
 
 **Separation from the coarse path.** `GRANT`/`REVOKE` go to the `polaris` Ranger service via
-`[access_control]`; Polaris enforces those at the catalog level. The `hive` Ranger service is
+`[access_control]`; Polaris enforces those at the catalog level. The `query` Ranger service is
 read by SQE's policy engine for row/column enforcement. A query must pass both gates: the Polaris
 gate (can the user load the table?) and SQE's rewriter (what rows and columns may the user see?).
 Revoking the coarse `SELECT` grant still denies the query before any fine-grained check runs.
 
-**Shared with Apache Spark / Kyuubi.** The `hive` service is the same service those engines read,
+**Shared with Apache Spark / Kyuubi.** The `query` service is the same service those engines read,
 so the same policy set is shared across tools. A mask or row filter written for SQE applies to
 Spark queries through the same Ranger service and vice versa.
 
@@ -189,20 +190,29 @@ row-filter policy is seeded (see the SQE <-> Spark cross-compare below for why).
 
 `parity-test.sh` runs `SELECT id, ssn FROM sales_wh.sales.orders` as `bob` (role `engineer`) in
 both SQE and Apache Spark 3.5 + the Kyuubi Spark AuthZ (Ranger) plugin, and asserts byte-identical
-masked output. Both engines read the SAME Polaris catalog and the SAME Ranger `hive` service.
+masked output. Both engines read the SAME Polaris catalog and the SAME Ranger `query` service.
 
 ```
-bob --ROPC------> SQE   --reads hive svc--> mask applied by PlanRewriter
-bob --OS user---> Spark --reads hive svc--> mask applied by RangerSparkExtension (Kyuubi)
+bob --ROPC------> SQE   --reads query svc--> mask applied by PlanRewriter
+bob --OS user---> Spark --reads query svc--> mask applied by RangerSparkExtension (Kyuubi)
                    |
                    +-- both read the Iceberg table from the Polaris REST catalog
-                   +-- both resolve bob -> role engineer from the SAME Ranger `hive` service
+                   +-- both resolve bob -> role engineer from the SAME Ranger `query` service
 ```
 
-Spark connects to Polaris as the `root` service account (client_credentials); the per-user mask is
-Kyuubi's job, keyed on `bob` via `HADOOP_USER_NAME`. SQE's coarse Polaris gate (the embedded Ranger
-authorizer on the `polaris` service) and Kyuubi's hive-service access policy are seeded separately
-because the two engines authorize through two different Ranger services.
+Spark reaches Polaris as **bob**, using bob's own Keycloak bearer token on the Iceberg catalog, so
+both tiers see the same identity. The mask is still Kyuubi's job, keyed on `bob` via
+`HADOOP_USER_NAME`. SQE's coarse Polaris gate (the embedded Ranger authorizer on the `polaris`
+service) and Kyuubi's frontend-service access policy are seeded separately because the two engines
+authorize through two different Ranger services.
+
+Spark used to connect as the `root` service account here, which meant this demo showed mask parity
+with the object tier bypassed. Worse, a root-credentialed catalog alias defeats per-user identity
+for the whole session: a per-user token governs only the alias it is attached to, so a caller denied
+on their own alias reads the same table by naming the credentialed one. Overriding that alias's
+`token` does not help, because Iceberg prefers `credential` when both are set. `parity-test.sh` now
+asserts the property directly: a `spark-sql` with no caller token must fail to load the table.
+See `spark/spark-defaults.conf` for the full note.
 
 **Why the ssn mask is a CUSTOM portable-SQL expression, not a named type.** Named Ranger mask types
 are NOT byte-portable between SQE and Kyuubi:

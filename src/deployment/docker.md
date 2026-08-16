@@ -1,22 +1,31 @@
 # Docker
 
-SQE ships as a **single Docker image** containing two binaries: `sqe-server` (the engine) and `sqe-cli` (the client).
+SQE ships as a **single Docker image** containing the engine binaries (`sqe-server`, `sqe-worker`) and the client (`sqe-cli`).
 
 ## Image Layout
 
 ```mermaid
 graph TB
-    subgraph "sqe:latest (debian:bookworm-slim)"
+    subgraph "sqe:latest (chainguard/glibc-dynamic)"
         BIN1["/usr/local/bin/sqe-server"]
-        BIN2["/usr/local/bin/sqe-cli"]
-        USER["User: sqe (UID 1000)"]
+        BIN2["/usr/local/bin/sqe-worker"]
+        BIN3["/usr/local/bin/sqe-cli"]
+        HC["/usr/local/bin/wget (healthcheck only)"]
+        USER["User: nonroot (UID 65532)"]
         EP["ENTRYPOINT: sqe-server"]
     end
 ```
 
-- **Base:** `debian:bookworm-slim` (~80MB), provides glibc, OpenSSL, CA certificates
-- **User:** Non-root `sqe` (UID 1000)
-- **Entrypoint:** `sqe-server`, the mode is selected via `--mode` flag or `SQE_MODE` env var
+- **Build:** one multi-stage Dockerfile. Stage 1 is `rust:<toolchain>-bookworm` and a plain `cargo build --release --locked`. No cargo-chef, no sccache. Same file for local compose, data-platform quickstart/sqe, and aikido/kaniko.
+- **Base (runtime):** `cgr.dev/chainguard/glibc-dynamic` (digest-pinned). glibc, libgcc, and CA certificates only. No shell, no package manager, no OpenSSL.
+- **Why not Debian slim / distroless:** the binaries link only `libc` / `libm` / `libgcc` (TLS is rustls). Bookworm-slim carried hundreds of unused OS CVEs. Distroless cut most of that but still fails the Aikido image gate on unfixed debian `libc` criticals. Chainguard is clean under `grype --fail-on high`.
+- **User:** Non-root UID/GID **65532**. Helm `securityContext` matches this UID.
+- **Healthcheck:** static busybox `wget` (exec form). Kubernetes uses HTTP probes on `/healthz` and does not need wget.
+- **Entrypoint:** `sqe-server`. Mode is selected via `--mode` or `SQE_MODE`.
+- **CI (Aikido):** `aikido-build` runs kaniko with `--target=runtime`. On merge, `aikido-image-vuln` runs `grype registry:$AIKIDO_IMAGE --fail-on high`.
+- **Bench image:** `docker build --target bench-runtime -t sqe-bench:latest .` (same Dockerfile).
+
+There is no shell in the image. `docker exec -it <container> sqe-cli` still works (the CLI binary is present). `docker exec ... bash` does not.
 
 ## Build
 
@@ -70,10 +79,11 @@ docker exec sqe-coordinator sqe-cli -e "SELECT COUNT(*) FROM raw.orders;"
 
 # With explicit connection
 docker run --rm -it --network host \
-  sqe:latest sqe-cli --host localhost --port 50051 --user alice
+  --entrypoint /usr/local/bin/sqe-cli \
+  sqe:latest --host localhost --port 50051 --user alice
 ```
 
-Note: when using `docker exec`, `sqe-cli` connects to `localhost:50051` by default, which is the coordinator running in the same container.
+Note: when using `docker exec`, `sqe-cli` connects to `localhost:50051` by default, which is the coordinator running in the same container. Override the entrypoint when `docker run` should start the CLI instead of the server.
 
 ## Docker Compose
 
@@ -94,7 +104,8 @@ services:
       SQE_STORAGE__S3_ACCESS_KEY: ${S3_ACCESS_KEY}
       SQE_STORAGE__S3_SECRET_KEY: ${S3_SECRET_KEY}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      # exec form: no shell in the image
+      test: ["CMD", "/usr/local/bin/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9091/healthz"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -118,5 +129,6 @@ services:
 | **Version skew** | Coordinator, workers, and CLI are always the same build |
 | **CI/CD** | One image to build, scan, and promote |
 | **K8s simplicity** | Same `image:` field, different `--mode` arg |
-| **Debugging** | `kubectl exec` into any pod, and `sqe-cli` is right there |
+| **Debugging** | `kubectl exec` / `docker exec` can run `sqe-cli` (no shell) |
 | **Size overhead** | Minimal: both roles share 95% of their code |
+| **CVEs** | OS surface is distroless + a static healthcheck wget, not a full Debian userland |

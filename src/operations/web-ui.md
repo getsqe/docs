@@ -14,24 +14,38 @@ query path.
 - Open `http://<coordinator-host>:<metrics_port + 1>/`. With the default
   `metrics.prometheus_port = 9090`, that is `http://localhost:9091/`.
 - The same port also serves `/healthz`, `/readyz`, and `/api/v1/status`.
-- The UI is on by default. Turn it off with:
+- The UI is **off by default**. Turn it on with:
 
   ```toml
   [metrics]
-  web_ui = false
+  web_ui = true
   ```
 
-  When off, `/healthz`, `/readyz`, and `/api/v1/status` still respond; the
-  dashboard and the `/api/v1/queries*` endpoints return 404.
+  This is TOML-only: there is no `SQE_METRICS__*` environment override for it.
+
+  When off, `/healthz`, `/readyz`, `/api/v1/status`, and the admin endpoints
+  below still respond; the dashboard and the `/api/v1/queries*` endpoints
+  return 404.
 
 ## Security
 
-There is no login. The dashboard is network-gated, the same posture as the
-Prometheus `/metrics` endpoint: anyone who can reach the port sees every user's
-query text and the cluster state. Keep the health port on an internal network.
+The dashboard and its JSON API (`/`, `/api/v1/overview`, `/api/v1/queries*`,
+`/api/v1/workers`, `/api/v1/metrics/history`) are gated by
+`require_admin_bearer` (`crates/sqe-coordinator/src/web_auth.rs`, applied in
+`build_health_router` in `sqe_server.rs`). A request needs
+`Authorization: Bearer <token>` for an identity that holds an admin role. No
+token, a bad token, or no auth provider configured is 401. A valid non-admin
+token is 403. The UI is **off by default** (`[metrics] web_ui = false`); when
+off, those routes are not registered and return 404.
+
+`/healthz`, `/readyz`, and `/api/v1/status` stay open. They are the probe
+surface for Kubernetes and load balancers. The Prometheus `/metrics` endpoint
+on the metrics port is also ungated. Keep the metrics and health ports on an
+internal network.
+
 The UI is strictly read-only. It cannot submit queries, cancel them, or change
-configuration. The query-detail endpoint deliberately omits session id, client
-IP, and roles so the unauthenticated surface stays small.
+configuration. The query-detail endpoint omits session id, client IP, and roles
+so a leaked admin token still exposes less session metadata.
 
 ## Tabs
 
@@ -63,6 +77,35 @@ are stable and safe to scrape directly:
 | `GET /api/v1/workers` | worker nodes with health and in-flight load |
 | `GET /api/v1/metrics/history` | time-bucketed series for the charts |
 | `GET /api/v1/status` | Ballista/DataFusion-style cluster status |
+
+## Admin endpoints
+
+Mutating endpoints on the same port sit behind the same bearer + admin gate as
+the dashboard. Unlike the dashboard, they are **always registered**, whether or
+not `metrics.web_ui` is on: they are control-plane hooks, not part of the
+read-only UI, and coupling catalog invalidation to "dashboard enabled" made the
+hook silently unavailable on a default deployment. The gate fails closed, so
+with no auth provider configured they answer 401 rather than running.
+
+| Endpoint | Effect |
+|---|---|
+| `POST /api/v1/catalogs/refresh` | Invalidates SQE's catalog caches so a catalog created or rebound out-of-band becomes visible immediately, instead of waiting out `coordinator.session_context_cache_ttl_secs`. Drops every session's cached `SessionContext` and the shared REST-catalog cache. An optional JSON body `{"username": "<u>"}` scopes the session drop to one user; a bodyless POST invalidates all sessions. Returns `{"invalidated": "all" \| "session:<u>"}`. |
+
+The platform's workspace-provisioning path calls this right after it creates or
+binds a Polaris catalog, so a new workspace catalog is queryable at once. A
+pure-SQL client that only needs to refresh its own view can instead run `CALL
+system.refresh_catalog_cache()` (see [CALL procedures](../sql-reference/procedures.md)).
+
+```bash
+# Global refresh (admin bearer required):
+curl -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  http://coordinator:9091/api/v1/catalogs/refresh
+
+# Scope the session drop to one user:
+curl -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{"username":"alice"}' \
+  http://coordinator:9091/api/v1/catalogs/refresh
+```
 
 ## How it is built
 

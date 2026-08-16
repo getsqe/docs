@@ -93,9 +93,15 @@ equality deletes.
 - **DuckDB iceberg extension**: position-delete reads land in the 2025
   release; equality deletes are not yet supported.
 
-If you cannot guarantee all readers support the delete-file format, run
-compaction (`CALL system.rewrite_data_files(...)`) regularly to collapse
-delete files back into data files.
+`system.rewrite_data_files` is delete-aware. It reads each file group
+through the Iceberg scan, so position and equality deletes are applied
+during the rewrite: the compacted files hold only surviving rows and
+deleted rows never reappear. The output is pinned to the sequence number
+of the snapshot it read, so an equality delete another writer commits
+mid-compaction still applies to the compacted files. Fully-covered
+position delete files are dropped in the same commit; equality deletes are
+left to age out through `expire_snapshots`. Compaction is safe to run on
+Merge-on-Read tables without materializing their deletes first.
 
 ## Primary keys
 

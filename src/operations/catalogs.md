@@ -124,6 +124,38 @@ The location is a directory. SQE creates `<dir>/catalog.db`
 for table data. Useful for dbt model development without a Polaris
 deployment.
 
+## Example: a shared PostgreSQL catalog over JDBC
+
+```sql
+CREATE SECRET pg_cat (TYPE basic, USERNAME 'iceberg', PASSWORD 's3cr3t');
+
+ATTACH 'jdbc:postgresql://db.internal:5432/iceberg' AS shared (
+  TYPE jdbc,
+  WAREHOUSE 's3://lake/warehouse',
+  SECRET pg_cat
+);
+
+SELECT * FROM shared.analytics.events LIMIT 10;
+```
+
+The backend is the same SQL catalog `TYPE sqlite` uses, so PostgreSQL, MySQL,
+and SQLite all work through one code path. Write the location either as
+`jdbc:postgresql://...`, the form Java tools use, or as `postgresql://...`; the
+`jdbc:` prefix is stripped when present.
+
+`WAREHOUSE` is required because a SQL catalog stores table metadata pointers
+rather than the data itself, so the data root cannot be inferred from the
+connection URL.
+
+Credentials belong in a `basic` secret rather than inline in the URL. The secret
+wins if the URL also carries a `user:password@` pair, which keeps rotating the
+secret meaningful. Characters that would otherwise break a URL, such as `@`,
+`:`, and `/`, are percent-encoded on the way in, so a password does not need
+pre-escaping.
+
+Requires one of the `sql`, `sql-postgres`, or `sql-sqlite` cargo features. A
+binary built without them reports which feature is missing.
+
 ## SHOW CATALOGS and SHOW SECRETS
 
 `SHOW CATALOGS` includes every TOML-configured catalog plus the two
@@ -149,19 +181,28 @@ errors at policy enforcement time, not at catalog build time.
 
 ## Lifecycle and persistence
 
-The runtime catalog registry is process-local and in-memory. A
-restart wipes every attached catalog and every created secret. There
-is no on-disk persistence in v1.
+ATTACH mounts are process-local and in-memory. A coordinator restart
+forgets every catalog attached via SQL. Static TOML catalogs (the
+`[catalog]` and `[catalogs.*]` blocks) are the right shape for "this
+is part of the deployment." ATTACH is the right shape for "this is
+part of this session."
 
-This is intentional. Persistent ATTACH (where catalogs survive a
-restart) is a feature operators ask for but most do not want once
-they think it through. A catalog attached at 9 AM on Monday is in
-the system at 3 AM on Sunday because someone forgot to DETACH it.
-The credentials behind it have rotated. Queries against it return
-401. The on-call engineer wakes up to a query failure for a catalog
-they did not know existed. Static TOML is the right place for
-"part of the deployment." ATTACH is the right place for "part of
-this session."
+`CREATE SECRET` is memory-only by default. Set
+`[session] secrets_path` (or `SQE_SESSION__SECRETS_PATH`) to snapshot
+the store as plaintext JSON after every create or drop. The file is
+written at mode 0600. Startup logs a warning because the bytes are
+credentials. Do not put the file on a shared volume.
+
+The snapshot restores secrets after a restart. It does not restore
+ATTACH mounts. Re-issue ATTACH after boot, or keep shared catalogs
+in TOML.
+
+Persistent ATTACH is a feature operators ask for but most do not
+want once they think it through. A catalog attached at 9 AM on
+Monday is in the system at 3 AM on Sunday because someone forgot
+to DETACH it. The credentials behind it have rotated. Queries
+against it return 401. The on-call engineer wakes up to a query
+failure for a catalog they did not know existed.
 
 ## Troubleshooting
 
