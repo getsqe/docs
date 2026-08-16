@@ -13,7 +13,9 @@
 # the gate trips on a new pattern, add a redaction rule below, never bypass it.
 set -euo pipefail
 
-SQE_DIR="${SQE_DIR:-/Users/jjverhoeks/git/schuberg/vpf-data-ai/chameleon/Applications/sqlengine}"
+# No default: this repo is public, and the real path discloses internal
+# usernames/group layout. A missing SQE_DIR fails loudly instead.
+SQE_DIR="${SQE_DIR:?set SQE_DIR to your local sqe checkout}"
 
 # Resolve the repo root as the script's parent dir's parent, so this works
 # regardless of the caller's working directory.

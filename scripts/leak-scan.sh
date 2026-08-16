@@ -31,7 +31,7 @@ GLOB="${2:-}"
 # deploy workflow used to pass '*.html', so that index was never scanned — a
 # leaked string would have been invisible to the gate and still retrievable
 # through the docs search box.
-SCAN_EXTS=(md mdx json html svg js mjs xml txt yml yaml css toml)
+SCAN_EXTS=(md mdx json html svg js mjs xml txt yml yaml css toml sh)
 
 # Case-insensitive leak regex (shared spec). jacobadmin/jacobbuilder matched
 # specifically (NOT bare "jacob") to avoid false hits on an author byline.
@@ -39,6 +39,25 @@ SCAN_EXTS=(md mdx json html svg js mjs xml txt yml yaml css toml)
 # inside longer digit runs (e.g. 19-digit Iceberg snapshot ids). The canonical
 # placeholder account ids 123456789012 / 000000000000 are allowlisted below.
 REGEX='(^|[^0-9])[0-9]{12}([^0-9]|$)|chore/|feat/|crates/sqe-|eu-(central|west)|amazonaws|MR !|sbp\.gitlab|gitlab\.schubergphilis|vpf-data-ai|jacobadmin|jacobbuilder'
+
+# .sh files get a NARROWER rule set: only internal-identifier/path rules, not
+# content rules (eu-region, amazonaws, crate paths). Sync scripts legitimately
+# describe those redaction TARGETS in their own sed commands and comments,
+# which would otherwise self-trigger the moment .sh became scannable. The
+# identifier rules below have no such legitimate occurrence — they exist to
+# catch exactly the hardcoded-checkout-path class of leak this rule set was
+# widened for. `/Users/[a-z]+/git` is .sh-ONLY: it would false-positive on
+# ordinary published prose (e.g. a quickstart line showing a local checkout
+# path) that has nothing to do with the maintainer's own machine.
+SH_REGEX='(^|[^0-9])[0-9]{12}([^0-9]|$)|sbp\.gitlab|gitlab\.schubergphilis|vpf-data-ai|jacobadmin|jacobbuilder|/Users/[a-z]+/git'
+
+# The gate's own pattern-definition file is exempt by its OWN PATH (not a bare
+# basename match, which would also skip any synced file that happened to be
+# named identically): its entire purpose is to contain the literal strings
+# above as regex source, which is not a real disclosure — no different from a
+# scanner's own signature file containing its signatures. Nothing else is
+# exempt.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 # Collect hits. grep exits 1 when it finds nothing, which under `pipefail`
 # would abort the script on the (desired) clean case, so guard with `|| true`.
@@ -56,10 +75,16 @@ fi
 hits=""
 scanned=0
 while IFS= read -r -d '' f; do
+  resolved_f="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+  [ "$resolved_f" = "$SELF" ] && continue
   scanned=$((scanned + 1))
+  re="$REGEX"
+  case "$f" in
+    *.sh) re="$SH_REGEX" ;;
+  esac
   file_hits="$(
     sed 's#crates/sqe-cli##g; s#crates/sqe-coordinator##g; s#123456789012##g; s#000000000000##g' "$f" \
-      | grep -Ein "$REGEX" \
+      | grep -Ein "$re" \
       | sed "s#^#${f}:#" \
       || true
   )"
