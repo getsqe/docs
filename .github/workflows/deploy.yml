@@ -40,7 +40,7 @@ jobs:
         run: mdbook build
 
       - name: Leak-scan built book (blocking gate)
-        run: bash scripts/leak-scan.sh book '*.html'
+        run: bash scripts/leak-scan.sh book
 
       - name: Add CNAME for custom domain
         if: github.event_name != 'pull_request'

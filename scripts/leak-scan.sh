@@ -21,7 +21,17 @@
 set -euo pipefail
 
 DIR="${1:?usage: leak-scan.sh <dir> [glob]}"
-GLOB="${2:-*.md}"
+GLOB="${2:-}"
+
+# Text extensions that reach the published output, used when no explicit glob
+# is given. Keep in sync across the three site gates; a gap here is silent.
+#
+# .js is the one that matters most here and was the original gap: mdBook emits
+# `searchindex-<hash>.js`, a multi-megabyte full-text index of every page. The
+# deploy workflow used to pass '*.html', so that index was never scanned — a
+# leaked string would have been invisible to the gate and still retrievable
+# through the docs search box.
+SCAN_EXTS=(md mdx json html svg js mjs xml txt yml yaml css toml)
 
 # Case-insensitive leak regex (shared spec). jacobadmin/jacobbuilder matched
 # specifically (NOT bare "jacob") to avoid false hits on an author byline.
@@ -32,8 +42,21 @@ REGEX='(^|[^0-9])[0-9]{12}([^0-9]|$)|chore/|feat/|crates/sqe-|eu-(central|west)|
 
 # Collect hits. grep exits 1 when it finds nothing, which under `pipefail`
 # would abort the script on the (desired) clean case, so guard with `|| true`.
+if [ -n "$GLOB" ]; then
+  find_expr=(-name "$GLOB")
+else
+  find_expr=()
+  for ext in "${SCAN_EXTS[@]}"; do
+    [ ${#find_expr[@]} -eq 0 ] || find_expr+=(-o)
+    find_expr+=(-name "*.${ext}")
+  done
+  find_expr=(\( "${find_expr[@]}" \))
+fi
+
 hits=""
+scanned=0
 while IFS= read -r -d '' f; do
+  scanned=$((scanned + 1))
   file_hits="$(
     sed 's#crates/sqe-cli##g; s#crates/sqe-coordinator##g; s#123456789012##g; s#000000000000##g' "$f" \
       | grep -Ein "$REGEX" \
@@ -43,11 +66,19 @@ while IFS= read -r -d '' f; do
   if [ -n "$file_hits" ]; then
     hits="${hits}${file_hits}"$'\n'
   fi
-done < <(find "$DIR" -type f -name "$GLOB" -print0)
+done < <(find "$DIR" -type f "${find_expr[@]}" -print0)
 
 if [ -n "$hits" ]; then
   printf '%s' "$hits"
   exit 1
+fi
+
+# A scan that matched nothing looks exactly like a clean one here (this gate is
+# silent on success by design), and a wrong path is an easy mistake. Fail loudly
+# on stderr instead, so a caller capturing stdout still sees the non-zero exit.
+if [ "$scanned" -eq 0 ]; then
+  echo "leak-scan: matched 0 files under '$DIR'${GLOB:+ (glob $GLOB)} — refusing to report clean" >&2
+  exit 2
 fi
 
 exit 0
