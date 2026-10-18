@@ -40,6 +40,7 @@ Pass credentials directly in the SQL statement. This is the primary mechanism us
 ```sql
 SELECT * FROM read_parquet(
   's3://bench-data/tpch/sf1/lineitem/*.parquet',
+  -- nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.aws-access-token -- AWS documentation example key
   access_key => 'AKIAIOSFODNN7EXAMPLE',
   secret_key => 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
   endpoint   => 'http://localhost:9000',
@@ -59,6 +60,80 @@ SELECT * FROM read_parquet('s3://bench-data/tpch/sf1/lineitem/*.parquet');
 ```
 
 This is convenient for internal workloads where the engine already has ambient S3 credentials configured.
+
+### Which paths the engine's credentials may read
+
+On a server, a read with the engine's own credentials is denied unless the
+path falls under an allowed prefix. The same rule covers `read_csv` and
+`read_json`. The global list applies to every session:
+
+```toml
+[storage.tvf]
+allowed_object_store_prefixes = ["s3://shared-landing/", "s3://scratch/{user}/"]
+```
+
+A catalog can add prefixes of its own. They apply only to sessions scoped to
+that catalog, so one coordinator can serve several workspaces that each read
+only their own landing buckets:
+
+```toml
+[catalogs.ws_energy]
+tvf_prefixes = ["s3://ws-energy-landing/"]
+
+[catalogs.ws_retail]
+tvf_prefixes = ["s3://ws-retail-landing/"]
+```
+
+A session is scoped to the catalog it resolves as its default: the one named
+by `X-Trino-Catalog`, `USE` or the Flight SQL catalog, or the configured
+default catalog when it names none. A session on `ws_retail` that reads
+`s3://ws-energy-landing/...` is refused, and the error names the session
+catalog.
+
+Naming a catalog is not enough. Any client can send `X-Trino-Catalog:
+ws_energy`. The prefixes open only when that catalog answered the caller's own
+bearer while the session was built: its namespace listing succeeded with
+per-user catalog auth (the default session bearer). A caller without grants
+on `ws_energy` gets a 403 there and none of its prefixes. A catalog that uses
+engine-held auth (a static token, client credentials, AWS) or a non-REST
+backend answers every caller alike, so it proves nothing and its
+`tvf_prefixes` never open. Use the global list there. A warehouse discovered
+from Polaris, not declared in `[catalogs.*]`, adds no prefixes. Catalog prefixes match on path-segment boundaries and
+expand `{user}` just like the global list. An entry that is not an
+object-store URL with a bucket fails config validation at startup. Hive
+external tables use the global list only, because a Hive root is shared by
+every session that reads it.
+
+#### One entry for every workspace: `{catalog}`
+
+When the workspaces' staging areas follow one layout, a single global entry
+can cover them all:
+
+```toml
+[storage.tvf]
+allowed_object_store_prefixes = ["s3://staging/ingest/ws/{catalog}/"]
+```
+
+`{catalog}` expands to the session's catalog, under the same proof as
+`tvf_prefixes`: the catalog must have answered the caller's own bearer while
+the session was built. A warehouse discovered from Polaris
+(`catalog_discovery = "polaris-auto"`) counts. A member of `ws1` in a `ws1`
+session reads `s3://staging/ingest/ws/ws1/...`. The same caller in a `ws2`
+session, or a caller who names `ws1` without grants on it, is refused. It
+never expands to every catalog the caller can see, only to the one the
+session is on.
+
+With no such catalog the entry is dropped. It never matches as an empty
+segment, so `s3://staging/ingest/ws//...` stays closed. Names match exactly
+and case-sensitively, and a name outside `A-Z a-z 0-9 . _ - @ +`, or one
+containing `..`, never expands. `{user}` and `{catalog}` can share an entry,
+for example `"s3://scratch/{catalog}/{user}/"`, and both must resolve.
+
+Complete inline credentials bypass these prefixes by default, because the
+engine's key is not used. A deployment that relies on the prefixes to keep
+workspaces apart must also set `allow_inline_credentials = false`, so a
+caller cannot bring their own keys to another workspace's path.
+`allow_all_object_stores = true` turns the prefixes off entirely.
 
 ## Glob patterns
 

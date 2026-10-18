@@ -51,7 +51,9 @@ helm install sqe deploy/helm/sqe/ \
 
 Workers are **disabled by default**. The coordinator runs queries locally.
 
-`values.yaml` is the easy dev path (`production_mode: false`). For production, overlay `values-production.yaml`: it turns on `production_mode`, rate limiting, a durable audit PVC, and ServiceMonitor. You must still supply existing Secrets, TLS/ingress, and `workerSecret` when workers are on. Templating fails if `production_mode` and `worker.enabled` are both true with an empty worker secret.
+`values.yaml` is the easy dev path (`production_mode: false`). For production, overlay `values-production.yaml`: it turns on `production_mode`, rate limiting, `catalog.require_vended_credentials`, a durable audit PVC, and ServiceMonitor. You must still supply existing Secrets, TLS/ingress, and `workerSecret` when workers are on. Templating fails if `production_mode` and `worker.enabled` are both true with an empty worker secret. The engine also refuses to start if a REST catalog still has `require_vended_credentials = false`.
+
+`production_mode` also refuses the two governance defaults: `policy.engine = passthrough` (no row filters, masks or column restrictions; only catalog-level authorization applies) and `access_control.backend = none` (GRANT and REVOKE rejected). The overlay selects the Ranger pairing for both; fill in `config.policy.ranger.url` and provide the admin password as the `SQE_POLICY__RANGER__ADMIN_PASSWORD` environment override. A deployment that deliberately runs without a policy engine or grant backend says so with `config.security.allow_no_policy_engine` / `config.security.allow_no_grant_backend`; the choice is then visible in the values diff, and the coordinator logs the disabled enforcement at warn level on every start.
 
 ```bash
 helm install sqe deploy/helm/sqe/ \
@@ -145,7 +147,12 @@ service:
   flightSqlPort: 50051
   trinoHttpPort: 8080
   metricsPort: 9090
+  mcpPort: 8098
 ```
+
+The Service publishes Flight SQL, Trino HTTP, and metrics, plus `mcpPort` when MCP is on. `healthPort` (9091) is a container port used by the probes and is NOT in the Service, so the web UI served there reaches no cluster client through it.
+
+MCP is off by default. Set `config.mcp.enabled: true` to render `[mcp]` into `sqe.toml` and add an `mcp` container port (`config.mcp.port`) and Service port (`service.mcpPort`), both 8098 by default. With `ingress.enabled` the chart also routes `/mcp` on the same host, and refuses to render unless `ingress.tls` is set. `config.mcp.auth.mode` must be `oauth` (which needs `config.mcp.authorization_servers`) or `static`; the chart refuses `anonymous`. Set `config.mcp.resource_uri` to the HTTPS URL clients actually call, because it is the token audience.
 
 ### Health Probes
 
@@ -251,6 +258,8 @@ Toggle the budgets with `podDisruptionBudget.enabled` (default `true`) and tune 
 
 ### The coordinator is a single point of failure
 
-The coordinator runs as a single replica. Session state, the worker registry, and in-flight query state are process-local; there is no shared store. A coordinator restart drops every in-flight query and invalidates client sessions, so connected clients must re-authenticate and re-run. A node drain that moves the coordinator pod is a brief outage, not a transparent failover.
+**Service level we ship: restartable, not HA.** One active coordinator. A restart kills in-flight queries and live sessions. Clients retry. Queries do not survive the process. That is the production contract (issue #405). Do not advertise multiple coordinators as HA until there is an external session and query store, plus fencing.
 
-Running more than one coordinator replica is not yet safe. Two replicas do not share sessions or the registry, so clients would land on a coordinator that has never seen their session. Keep `coordinator.replicas: 1`. Full coordinator HA with shared session and registry state is a separate design.
+The coordinator runs as a single replica. Sessions, the query tracker, cancellation, caches, `CREATE SECRET` and `ATTACH` are process-local. Session-file restore is incomplete: tokens are omitted, so a restored session is not a live one. There is no shared store. A coordinator restart drops every in-flight query and invalidates client sessions, so connected clients must re-authenticate and re-run. A node drain that moves the coordinator pod is a brief outage, not a transparent failover.
+
+The Helm PDB `minAvailable: 1` only blocks an unforced eviction. Two replicas behind a generic load balancer are unsafe: they do not share sessions or the registry, so a client would land on a coordinator that never saw its session. Open transactions are process-local too. A Trino transaction id that reaches another coordinator, or the same one after a restart, fails with `TRANSACTION_CONFLICT` instead of starting an empty transaction, and a graceful shutdown rolls back every open transaction. Keep `coordinator.replicas: 1`. Full coordinator HA is a later design.

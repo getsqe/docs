@@ -25,6 +25,7 @@ This approach means:
 - **Column masks** block predicate pushdown on raw values. You can't `WHERE ssn = '123-45-6789'` to probe masked data
 - **Denied columns** are invisible. They don't appear in `SELECT *`, not as errors
 - **The optimizer can push user predicates through row filters** but not through column masks
+- **A user predicate that can fail never runs on a hidden row.** The optimizer merges the row filter and the user's `WHERE` into one conjunction and may evaluate the user side on every row, so `WHERE 1 / (id - 2) = 1` could raise a division-by-zero error from a row the user cannot see. Like PostgreSQL's leakproof rule, only predicates that cannot fail (comparisons, `IN`, `BETWEEN`, `LIKE` with a constant pattern, boolean logic, lossless casts, `EXISTS` and `IN (subquery)`) pass through freely; a subquery's own predicates are checked the same way. When a query holds anything else (arithmetic, functions, a cast that can fail), each row-filtered table is read through `CASE WHEN <row filter> THEN col END`, so a hidden row is all `NULL` to the user's expressions. Those tables then lose scan pruning on the user's predicates for that query. `DELETE`, `UPDATE` and `MERGE` always read the target table through the same guard, so the `WHERE`, `ON`, clause predicates and `SET` expressions never see a hidden row's values, and a row the row filter does not admit (including one where it evaluates to `NULL`) is never deleted, matched or changed
 
 ## Policy Enforcer Trait
 
@@ -138,6 +139,33 @@ Enable `debug = true` during development to see full error details:
 [coordinator]
 debug = true
 ```
+
+
+### Worker Trust: Signed Scan Tickets
+
+In distributed mode, the coordinator mints signed scan tickets that workers execute. SQE uses a two-key model to prevent a compromised worker from forging or replaying tickets:
+
+1. **Coordinator key:** Ed25519 private key on the coordinator only (`[coordinator] ticket_signing_key_file`). Signs every ticket. Never shipped to workers.
+2. **Worker verification key:** Ed25519 public key on every worker (`[worker] ticket_public_key`). Verifies ticket signatures. Workers also receive it via the heartbeat response from the coordinator over the authenticated channel.
+
+Each ticket carries:
+- **Audience:** the target worker's advertised URL. Workers refuse tickets for a different audience.
+- **Expiry:** absolute wall-clock time (`[coordinator] ticket_ttl_secs`, default 300 seconds). Expired tickets are rejected.
+
+Heartbeats are bound to the peer: when mTLS is off (the common case), the advertised URL's host must resolve to the TCP peer that sent the heartbeat, unless `[coordinator] allow_unverified_advertise = true` (test-only, behind a NAT/proxy). Mismatches are logged as audit events.
+
+**Migration:** If you still have coordinators running pre-Ed25519 code alongside new workers, set `[worker] accept_hmac_tickets = true` on new workers to accept the legacy HMAC-signed tickets while you roll the coordinators. The HMAC key is the shared secret every worker holds, so the HMAC proves nothing; turn this option off as soon as all coordinators are upgraded.
+
+Distributed compaction (`compact_file_group`) uses the same signature scheme, so a mixed-version rollout affects it too. A new coordinator with an old worker fails distributed compaction: the old worker checks the `ed25519:` tag as an HMAC and refuses it. An old coordinator with a new worker is refused unless the worker sets `accept_hmac_tickets`, which `production_mode` forbids. Queries are not affected by this change; scan tickets follow the paragraph above. During a mixed-version rollout, set `[maintenance.distribution] mode = "local"` so compaction runs on the coordinator, and restore it once every node is upgraded.
+
+### Distributed Scan Credentials
+
+Scan tickets carry storage credentials. The source is chosen per-query via `[coordinator] distributed_credentials`:
+
+- **`auto` (default):** Use catalog-vended credentials (from the table's FileIO properties) when present; otherwise fall back to the static `[storage]` key pair. Issues a one-time warning when falling back. Under `production_mode`, falls back only when truly unavailable (Polaris credential vending omitted).
+- **`vended`:** Strict mode. Refuse to distribute queries over tables without vended credentials. Fails the query if the table has no session token or STS credentials.
+- **`static`:** Explicit single-tenant mode. Always ship the static `[storage]` key pair, never use vended credentials.
+- **`worker_default`:** Workers resolve credentials from their own environment (IRSA, pod IAM role, `AWS_*` env vars). No credentials in the ticket. Requires every worker to have independent S3 access.
 
 ### TLS Encryption
 

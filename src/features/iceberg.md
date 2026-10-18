@@ -4,13 +4,14 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 
 ## Iceberg version
 
-- **iceberg-rust**: SQE-rebased fork of [risingwavelabs/iceberg-rust](https://github.com/risingwavelabs/iceberg-rust) `dev_rebase_main_20260303` at commit `c034b19105fa`, vendored at `vendor/iceberg-rust/`. Provides `RewriteFilesAction` / `OverwriteFilesAction` (Copy-on-Write DELETE/UPDATE), `PositionDeleteFileWriter` (Merge-on-Read position deletes), and `DeletionVectorWriter` (Iceberg V3) on top of upstream v0.9.0.
-- **DataFusion**: 54.0
-- **Arrow**: 58
-- **Parquet**: 58
-- **Iceberg table format**: V2 and V3. V3 features verified end-to-end (TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution).
+- **iceberg-rust**: [apache/iceberg-rust](https://github.com/apache/iceberg-rust) `main`, with the [RisingWave fork](https://github.com/risingwavelabs/iceberg-rust)'s `dev_rebase_main_20260807` branch merged on top for the row-level write stack apache does not ship yet: `ReplaceFilesAction` for Copy-on-Write DELETE and UPDATE, position-delete and deletion-vector writers for Merge-on-Read. Vendored at `vendor/iceberg-rust/`.
+- **DataFusion integration**: [apache/datafusion-iceberg](https://github.com/apache/datafusion-iceberg), vendored at `vendor/datafusion-iceberg/`. SQE's own scan does not depend on it.
+- **DataFusion**: 55
+- **Arrow**: 59
+- **Parquet**: 59
+- **Iceberg table format**: V2 and V3. V3 is the default for new tables. V3 features verified end-to-end: TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution, deletion vectors, row lineage, `VARIANT`, and top-level unknown columns.
 
-The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 167/189 (88.4%), placing SQE fifth on the public scoreboard behind only Spark distributions (EMR, AWS Glue, OSS Spark, Dataproc). See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
+The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 147/162 (90.7%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Architecture
 
@@ -139,7 +140,7 @@ Supported DML, both V2 and V3 verified:
 - **MERGE INTO**: full WHEN MATCHED / WHEN NOT MATCHED semantics, dispatching to CoW or MoR based on the table's `write.merge.mode` (default copy-on-write).
 - **ALTER TABLE**: `ADD/DROP/RENAME COLUMN`, `SET/DROP NOT NULL`, type promotion, `ADD/DROP/REPLACE PARTITION FIELD` (partition evolution), `CREATE/DROP BRANCH/TAG`, `SET WRITE BRANCH`.
 
-DELETE reads `write.delete.mode`, UPDATE reads `write.update.mode`, and MERGE reads `write.merge.mode`. Each defaults to copy-on-write. CTAS and INSERT stream RecordBatches straight to Parquet at constant memory. Partitioned writes use an unbounded writer by default. Set `fanout_max_open_writers` or `fanout_buffer_budget` to opt into a bounded fanout writer that caps the number of open per-partition writers and flushes the least-recently-written one when a limit is hit.
+DELETE reads `write.delete.mode`, UPDATE reads `write.update.mode`, and MERGE reads `write.merge.mode`. Each defaults to copy-on-write. CTAS and INSERT stream RecordBatches straight to Parquet at constant memory. Partitioned writes use a bounded fanout writer by default. It caps the number of open per-partition writers and the buffered bytes, both derived from the memory pool unless `fanout_max_open_writers` or `fanout_buffer_budget` is set, and flushes the least-recently-written writer when a limit is hit.
 
 The writer respects `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp` for any column the schema knows about. The footer-inspection test in `sqe-catalog/src/parquet_writer_config.rs` proves bloom offsets land in the resulting Parquet file.
 
@@ -151,24 +152,26 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 - **`expire_snapshots`**: drops snapshots older than a cutoff, honouring `older_than` and `retain_last`.
 - **`remove_orphan_files`**: deletes data files no snapshot references.
 - **`rewrite_manifests`**: compacts manifest files.
-- **`register_table`** and **`drop_table`** (without purge): catalog-pointer operations for migration, disaster recovery, and the golden-dataset workflow.
-
-Snapshot-pointer procedures (`set_current_snapshot`, `rollback_to_snapshot`) and `drop_table(purge => true)` are not yet implemented and return an explicit error.
+- **`register_table`** and **`drop_table`**: catalog-pointer operations for migration, disaster recovery, and the golden-dataset workflow. `drop_table(purge => true)` also deletes the table's files with the caller's credentials, and refuses when another table shares the location (see [CALL procedures](../sql-reference/procedures.md#safety-notes)).
+- **`set_current_snapshot`** and **`rollback_to_snapshot`**: move the table's main branch to another snapshot.
 
 ## V3 features verified
 
 - **TIMESTAMP_NS / TIMESTAMPTZ_NS**: V3 nanosecond timestamps round-trip end-to-end.
+- **Variant**: `VARIANT` columns store unshredded variant values written from JSON text, survive CTAS and INSERT ... SELECT, and read back as JSON text ([details](../sql-reference/ddl.md#variant)). On a V3 table a `JSON` column is a variant too, and the `json*` functions read it. Shredded variant files written by other engines (for example Spark with `write.parquet.shred-variants`) read on the coordinator and on workers; SQE itself writes unshredded. Variant path functions (`variant_get`) are not supported yet.
 - **Column defaults**: `CREATE TABLE ... DEFAULT <literal>` applies `write_default`; `ALTER TABLE ADD COLUMN ... DEFAULT` applies `initial_default`.
-- **Position deletes (V3)**: MoR DELETE on a V3 table writes position-delete files.
+- **Deletion vectors (V3)**: MoR DELETE on a V3 table writes one deletion vector per data file, never a position-delete file. A second DELETE on the same file merges its existing deletes into a new vector and retires the old one in the same commit, so a data file never carries two. The engine refuses any commit that would add a position-delete file to a V3 table.
+- **Row lineage (V3)**: new rows get a fresh `_row_id` at commit. CoW DELETE / UPDATE / MERGE, MoR UPDATE / MERGE and `rewrite_data_files` carry `_row_id` and `_last_updated_sequence_number` into the files they write.
+- **Unknown columns (V3)**: a top-level `UNKNOWN` or `VOID` column holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. A Spark-written `VOID` column reads as NULLs. Nested unknown fields are refused.
 - **Equality deletes (V3)**: UPDATE with a declared identifier-field-id commits a single RowDelta with new data file plus equality-delete row.
 - **Partition evolution (V3)**: `ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD` evolves the spec on V3 tables, including with day(ts) on TIMESTAMP_NS columns.
 - **Time travel (V3)**: `FOR SYSTEM_TIME AS OF` and `FOR VERSION AS OF` work against V3 tables through the same snapshot walk as V2.
 - **Schema evolution (V3)**: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `SET DATA TYPE` all work on V3.
 
-V3 features still blocked upstream:
+V3 features not available yet:
 
-- **Variant**: pending iceberg-rust [#2188](https://github.com/apache/iceberg-rust/pull/2188).
-- **Geometry**: pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
-- **Vector / Embedding**: V3 spec not finalised.
+- **Geometry / geography**: no iceberg-rust support, and pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
+- **Multi-arg partition transforms**: `PARTITIONED BY` accepts single-source transforms only.
+- **Variant path functions**: no `variant_get` yet.
 
 The deferred list is tracked in `docs/evidence/iceberg-matrix-state.json` under `caveats` for each cell.

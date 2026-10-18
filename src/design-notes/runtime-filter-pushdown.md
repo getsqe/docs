@@ -13,6 +13,49 @@
 > log fed into, live in `docs/evidence/perf/ssb-sf10-root-cause-sf100-prep.md`.
 > Treat the code as authoritative where the two disagree.
 
+> **Update 2026-08-16, issue #415.** DataFusion 54 added
+> `PhysicalDynamicFilterNode` protobuf. A sealed `DynamicFilterPhysicalExpr`
+> serializes its inner tree. `HashTableLookupExpr` (the membership set above
+> `runtime_filter_inlist_max_values`) is rewritten to `lit(true)` in
+> `datafusion-proto` because the hash table is a process-local `Arc`. Shipping
+> that proto to a worker would drop membership, same as today's
+> `physical_filter_to_logical_lenient` path. The working path remains InList
+> below the cap (default 65536 / 4MB). Large-build membership cannot leave the
+> coordinator until DataFusion serializes the key set. Distributed SSB q4.1/q4.2
+> still lose partkey because part sits on the probe side; that is join order,
+> not this converter.
+
+> **Update 2026-08-18, issue #415: the loss is now measured, and observable.**
+> The drop was silent. A snapshot whose `hash_lookup` term is dropped still
+> converts successfully, because the min/max bounds around it survive, so the
+> push was logged as a win and nothing recorded that the selective half stayed
+> on the coordinator. `physical_filter_to_logical_reporting` now returns the
+> dropped conjuncts, `DistributedScanExec` counts them in a
+> `dynamic_filter_conjuncts_dropped` metric, and one debug line names the term
+> and whether anything was kept.
+>
+> Measured on a native two-worker rig against SF1 SSB with distribution forced
+> (`distribution_threshold = 1MB`, `distribution_file_threshold = 1`):
+>
+> | Configuration | Queries distributed | Filters pushed | Conjuncts dropped | Suite |
+> |---|---|---|---|---|
+> | Shipped cap (65536) | 13 | 26 | **0** | 7.36s |
+> | Cap forced to 64 | 13 | 26 | **62** | 10.01s |
+>
+> So at SF1 nothing is lost: every SSB dim build lands under the cap and
+> membership rides as an `InList`. Force the builds above the cap and the exact
+> shape the issue describes appears, 62 times, always as
+> `dropped: ["hash_lookup"]` with `kept: true` (bounds pushed, membership not).
+> The 36% suite cost of that configuration is the mechanism's price tag, not a
+> workload prediction.
+>
+> The transport stays blocked upstream, and the block is narrow:
+> `HashTableLookupExpr` exposes no accessor for its `Map`, and `Map` itself
+> only offers `num_of_distinct_key()` and `is_empty()`. SQE cannot read the
+> keys to rebuild an `InList` or hash them into a bloom, so the fix needs
+> either a key iterator upstream or a bloom built while the build side
+> materializes.
+
 ## Problem
 
 DataFusion 53 has a runtime / dynamic filter pushdown path: a `HashJoinExec`

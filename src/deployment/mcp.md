@@ -1,0 +1,729 @@
+# Model Context Protocol
+
+SQE can expose an MCP Streamable HTTP endpoint from the main coordinator
+binary. It is disabled by default. The endpoint is a protected OAuth resource,
+not an authorization server and not a credential proxy.
+
+## Identity and authorization
+
+The invariant is:
+
+```text
+user bearer -> MCP endpoint -> SQE Session -> catalog/storage source
+```
+
+The MCP client sends `Authorization: Bearer <user-access-token>` on every
+request. MCP passes it to SQE's normal auth chain. A successfully validated
+identity becomes the same per-user `Session` used by Flight SQL and Trino HTTP;
+if the auth provider does not return a separate catalog token, the original
+bearer is placed in the session and forwarded to the source. There is no MCP
+service account and no shared root credential.
+
+Source grants and SQE policy remain authoritative. OAuth scopes only limit the
+MCP surface; they never grant catalog, table, row, column, or storage access.
+
+Use a validating `bearer_token` provider for MCP. Configure its `audience` to
+the canonical `mcp.resource_uri`. Do not use `bearer_passthrough` for an
+internet-facing endpoint.
+
+## Configuration
+
+```toml
+[mcp]
+enabled = true
+# port = 8081 # optional dedicated listener; omit/zero to share health/web port
+# bind_address = "0.0.0.0" # dedicated listener's interface; empty = 127.0.0.1 in anonymous mode, 0.0.0.0 otherwise
+resource_uri = "https://sqe.example.com/mcp"
+authorization_servers = ["https://idp.example.com/realms/data"]
+allowed_origins = [] # add exact browser origins only when browser MCP clients need them
+read_scope = "sqe:mcp:read"
+write_scope = "sqe:mcp:write"
+allow_writes = false
+write_roles = ["data_writer"]
+# write_catalogs = ["iceberg"] # catalogs the change tool may target; see "Catalog scoping"
+# default_catalog = "iceberg"  # lets agents use two-part names
+# default_schema = "analytics"
+max_result_rows = 1000
+max_response_bytes = 2097152
+request_timeout_secs = 75    # per-statement deadline for a tool call; 0 = query.timeout_secs only
+
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://idp.example.com/realms/data/protocol/openid-connect/certs"
+issuer = "https://idp.example.com/realms/data"
+audience = "https://sqe.example.com/mcp"
+```
+
+The endpoint is `POST https://sqe.example.com/mcp`. In the main `sqe-server`
+binary, `enabled = true` with `port = 0` merges the MCP routes into the existing
+health/web listener (`metrics.prometheus_port + 1`). Set a nonzero `port` for a
+dedicated listener and independent network policy.
+
+SQE publishes RFC 9728
+metadata at both:
+
+- `/.well-known/oauth-protected-resource`
+- `/.well-known/oauth-protected-resource/mcp`
+
+Unauthorized responses include a `WWW-Authenticate: Bearer` challenge with
+`resource_metadata` and the required scope. The OAuth authorization server
+must expose RFC 8414 or OpenID Connect discovery metadata. MCP clients use
+Authorization Code with PKCE and the RFC 8707 `resource` parameter; SQE only
+validates the resulting access token.
+
+To prevent DNS-rebinding attacks, requests carrying an `Origin` header are
+rejected unless the exact origin appears in `allowed_origins`. Native MCP
+clients normally omit `Origin` and are unaffected. Avoid wildcard origins.
+
+On Kubernetes, the shipped Helm Service publishes Flight SQL, Trino HTTP and
+metrics only. `healthPort` is a container port used by the probes, so a
+shared-listener `/mcp` is not reachable through that Service as it stands. Give
+MCP a dedicated `port` and a Service port for it, or add a Service port for
+`healthPort`. See [Kubernetes & Helm](./kubernetes.md#service).
+
+A dedicated MCP listener uses `[coordinator.tls]`. The shared internal web
+listener is plaintext, as before, so terminate TLS at the ingress/reverse proxy.
+In either mode, the public `resource_uri` must use HTTPS in production.
+
+A dedicated listener is also supervised. Its accept loop runs in a task that
+cannot end quietly: a return, an error or a panic is logged at ERROR, the
+liveness flag behind `/healthz` and `/readyz` (`checks.mcp`) is cleared,
+readiness flips, and `sqe-server` exits with status 70 so the supervisor
+restarts it. The alternative, a live PID whose `/mcp` refuses connections, is
+invisible to every health check but the one on this port, and was seen on a
+laptop deployment after an idle hour. See
+[Observability](../features/observability.md#health-endpoints).
+
+Three more bounds sit on the listener. Every request has a deadline of
+`request_timeout_secs` plus fifteen seconds (90 s at the default), covering
+the parts a statement deadline does not: the token check, the metadata
+fan-out and the encoding; past it the client gets a 504 with a JSON-RPC
+error. `SIGTERM` and `SIGINT` stop the accept loop and give in-flight calls
+thirty seconds to finish instead of cutting them, and that exit is logged as
+a shutdown, not as the crash the supervisor watches for. The TLS certificate
+reload task is supervised: if it ends, the log says so at ERROR, because the
+alternative is serving the startup certificate until it expires with nothing
+in the log.
+
+## Okta as the authorization server
+
+Any provider that publishes discovery metadata and signs JWTs works; Okta needs
+three decisions that are easy to get wrong.
+
+- Use a **custom authorization server** (Security > API > Authorization
+  Servers), not the org server. The org server issues opaque access tokens SQE
+  cannot verify. Its issuer is `https://<org>.okta.com/oauth2/<server id>`
+  and that is the value for `authorization_servers` and `issuer`.
+- Set the server **audience** to `mcp.resource_uri`, define the scopes
+  `sqe:mcp:read` (default) and `sqe:mcp:write`, and add a `groups` claim on
+  the **access token** (value type Groups, regex filter). SQE reads the user
+  from `sub` and roles and groups from that claim.
+- Give the app an **access policy** whose rule allows the Authorization Code
+  grant. Without the policy Okta answers `access_denied` after login; with a
+  rule that lists only Device Authorization the browser shows "You are not
+  allowed to access this app" and the System Log says `no_matching_policy`.
+
+The app itself is a native, public client: Authorization Code + PKCE, no
+secret, sign-in redirect on the loopback port the MCP client listens on
+(`http://localhost:8400/callback` for the quickstart). Okta rejects anonymous
+dynamic client registration, so the client id is handed to the client
+(`claude mcp add --client-id ... --callback-port 8400`, or `oauth.clientId` in
+`.mcp.json`). The client id is not a secret.
+
+```toml
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://<org>.okta.com/oauth2/<server id>/v1/keys"
+issuer = "https://<org>.okta.com/oauth2/<server id>"
+audience = "http://localhost:19092/mcp"   # = mcp.resource_uri
+user_claim = "sub"
+roles_claim = "groups"
+groups_claim = "groups"
+```
+
+The runnable version, with the Okta objects as Terraform, is
+[MCP with Ranger and Okta on external data](../quickstart/mcp-ranger-okta.md).
+
+## Deployments with no identity provider
+
+The section above assumes every caller carries a user token. A catalog reached
+with engine credentials (AWS Glue, S3 Tables, an attached warehouse, an
+auth-less Nessie) has no such tokens: SQE runs those queries under one identity
+and the source authorizes the engine, not the person. `[mcp.auth] mode` covers
+that shape.
+
+For the simplest case, an anonymous read-only MCP endpoint over a Glue catalog,
+`sqe-server` runs flag-only with no config file at all:
+
+```bash
+sqe-server --glue-catalog glue --allow-s3-prefix s3://lake/ \
+  --mcp-anonymous --mcp-port 8098
+```
+
+See [Run SQE as an MCP server](../getting-started/mcp-server.md) for that path.
+The rest of this section is the config-file form for static and OAuth auth.
+
+```toml
+[mcp]
+enabled      = true
+resource_uri = "http://sqe.internal:9091/mcp"
+allow_writes = true
+
+[mcp.auth]
+mode = "static"                       # "oauth" (default) | "static" | "anonymous"
+
+[[mcp.auth.principals]]
+user      = "mcp-reader"
+roles     = ["reader"]
+token_env = "SQE_MCP_READ_TOKEN"      # preferred
+
+[[mcp.auth.principals]]
+user      = "mcp-writer"
+roles     = ["data_writer"]
+# nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.generic-api-key -- placeholder value
+token_b64 = "c3FlLXdyaXRlci10b2tlbi0x"
+default_catalog = "iceberg"           # this principal's sessions resolve two-part names here
+default_schema  = "staging"
+```
+
+A caller presents `Authorization: Bearer <token>`; SQE matches it against the
+configured principals in constant time and adopts that principal's user name
+and roles. `token_env` wins over `token_b64` when both are set. Base64 is
+encoding, not protection: anyone who can read the config can read the token, so
+use `token_env` outside development. Tokens resolve once at startup, and a
+token under 16 characters, an unset `token_env`, malformed base64, or two
+principals sharing a token all fail the config check rather than the first
+request.
+
+Static mode carries no OAuth scopes, because SQE is both the issuer and the
+verifier of these tokens. The three write gates become two: the principal's
+roles must intersect `write_roles`, and the source must authorize the
+statement. `enabled = true` with `allow_writes = true` and no principal holding
+a writer role is a startup error, since the write tool would be advertised and
+unusable.
+
+`mode = "anonymous"` accepts every caller as one fixed identity:
+
+```toml
+[mcp.auth]
+mode = "anonymous"
+
+[mcp.auth.anonymous]
+user  = "mcp-anonymous"
+roles = ["reader"]
+```
+
+Three conditions refuse it at startup:
+
+- any `auth.providers` entry that authenticates against an identity provider
+  (`oidc_password`, `client_credentials`, `client_credentials_passthrough`,
+  `token_exchange`, `bearer_token`, `bearer_passthrough`). A deployment that
+  can authenticate real callers has no reason to skip it. `api_key`, `mtls` and
+  `aws_iam` are local credential checks and do not block anonymous mode.
+- `production_mode`, matching the existing rule that refuses the `anonymous`
+  auth provider there.
+- `allow_writes = true`. An anonymous caller is nobody to attribute a write to.
+
+`[mcp.auth] mode` governs `/mcp` only. The SQL path keeps whatever
+`auth.providers` does, so the natural mode-2 configuration pairs an
+`anonymous` provider (every Flight SQL and Trino caller is one identity, as the
+`aws-glue` and `aws-s3-tables` quickstarts already do) with
+`mcp.auth.mode = "static"` (an MCP caller must present a configured token).
+The two lines look contradictory and are not: the anonymous provider describes
+the SQL door, the MCP mode describes the MCP door.
+
+The reverse pairing is refused. `mcp.auth.mode = "oauth"` with an `anonymous`
+auth provider fails at startup, because OAuth mode reads scopes out of the
+bearer's payload and leaves signature verification to the chain: a provider
+that verifies nothing would accept an unsigned token carrying the read scope,
+and in a deployment reached with engine credentials that token would read real
+data. `bearer_passthrough` is a weaker case (the source still validates the
+token it receives) and is refused only under `production_mode`, but do not use
+it for an internet-facing MCP endpoint.
+
+In both modes the OAuth machinery stands down: the two
+`/.well-known/oauth-protected-resource` routes are not mounted, and a `401`
+carries a bare `WWW-Authenticate: Bearer` with no `resource_metadata`.
+`authorization_servers` is required only in `oauth` mode. `resource_uri` stays
+required in all three.
+
+The MCP bearer is a credential for SQE, never forwarded upstream: the session
+built for a static or anonymous caller carries an empty catalog token, the same
+as the anonymous SQL path, and the source is reached with the engine's
+configured credentials.
+
+One consequence worth stating plainly. In `oauth` mode the source is the last
+line of defense, and a caller holding every scope SQE advertises still reads
+only what the catalog grants that user. In these two modes **there is no such
+last line**: the source serves whatever the engine's credentials can reach. The
+gates that were defense in depth become load-bearing, so keep `allow_writes`
+off unless a specific principal needs it, issue one token per caller so the
+audit log names something useful, and put the endpoint on a network only its
+callers can reach.
+
+## Tools
+
+The tool set is fixed per process, so `tools/list` carries the spec's cache
+hints (`ttlMs` of one hour, `cacheScope: public`, SEP-2549). A client that
+honours them lists once per session instead of once per turn; older clients
+ignore the two fields.
+
+Read tools are always available after the `sqe:mcp:read` scope is validated:
+
+- `execute_sql_readonly`
+- `list_catalogs` (plus `diagnostics`: one entry per Hive root the caller
+  can see, probed with `SHOW SCHEMAS` under a 5 s bound and reported as
+  `reachable`, `auth_error`, `timeout` or `unreachable` with a `detail`.
+  `auth_error` means the engine's own AWS credentials for that root are
+  missing or expired; nothing the client does fixes that, so a sidecar can
+  show it as an operator problem. The detail is the redacted form described
+  under "Error text" below, so the region and the SSO message are in the
+  server log under the `error_id`, not in the transcript. One more
+  entry with `kind: object_store` reports the engine's storage credentials
+  themselves: `provider` (`aws-sdk-default-chain`, `static-keys`,
+  `static-temporary-keys`), `status` (`ok`, `auth_error`, `unknown` for
+  static keys, `timeout`), and `expires_at` when the SDK knows when the
+  current credentials lapse. A sidecar checks this before starting a long
+  job; once it says `auth_error`, every scan fails with
+  `STORAGE_CREDENTIALS_UNAVAILABLE` while `SELECT 1` and the metadata tools
+  still answer)
+- `list_schemas`
+- `list_tables` (every row carries `table_type`, `table` or `view`, from one
+  `SHOW VIEWS` per call, so an agent tells the two apart without a call per
+  name)
+- `describe_table` (columns with type, nullability and the catalog's column
+  comment when it carries one: Iceberg `doc`, Glue column comment; for one
+  table already chosen. The server's `initialize` instructions steer agents
+  to `search_tables` then `describe_schema` for exploration: the first live
+  agent made 21 `describe_table` calls where 3 `describe_schema` calls would
+  have done)
+- `describe_schema` (a whole schema in one call, for catalog crawlers; see
+  below)
+- `get_table_ddl`
+- `get_table_stats` (`SHOW STATS FOR`; Iceberg snapshot counts, or a Hive
+  table's metastore `numRows` / `totalSize` when Glue or Hive recorded them,
+  never a scan)
+- `search_tables` (walks `SHOW SCHEMAS` and `SHOW TABLES` for one catalog and
+  matches a LIKE pattern server-side; a bare word is a case-insensitive
+  substring match; the catalog defaults to the session's; a schema the caller
+  may not list is skipped; rows carry `table_type` from one `SHOW VIEWS` per
+  schema that matched)
+- `sample_rows` (`SELECT * ... LIMIT n` as the caller, default 10, at most 100;
+  row filters and masks apply)
+- `explain_query`
+- `whoami` (identity metadata only; never tokens)
+- `refresh_metadata` (drops cached catalog metadata for a `table`, a `schema`,
+  or the session's catalog view; `CALL system.refresh_catalog_cache(...)`
+  underneath, so it needs no privilege and touches no other user's view;
+  one refresh per scope per 10 s, a repeat inside the window is a no-op that
+  says so; not annotated read-only, so clients that auto-approve reads still
+  ask)
+
+`execute_sql_readonly` is enforced with SQE's SQL parser/classifier, not a
+keyword regular expression. Exactly one statement is accepted. DDL, DML,
+maintenance procedures, grants, secrets, and session mutations are rejected
+before reaching the query handler. File table functions (`read_parquet`,
+`read_csv`, `read_json`) are refused: they read object-store paths with the
+engine's credentials and skip catalog grants. Query a table name, or use
+`sample_rows`.
+
+`execute_sql_change` is not advertised unless `allow_writes = true`. A call
+then needs all three independent authorizations:
+
+1. the OAuth token contains both the read scope and `write_scope`;
+2. the SQE identity has at least one role in `write_roles`;
+3. SQE and the source catalog/storage authorize that exact user and statement.
+
+The tool's surface is data statements and the DDL of tables, schemas and
+views: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`/`DROP`/`ALTER TABLE`,
+`SCHEMA` or `VIEW`, `TRUNCATE`, `ANALYZE`, partition and branch DDL. Anything
+else that is not read-only, `GRANT`/`REVOKE`/`DENY`, policy and tag DDL,
+secrets, `ATTACH`/`DETACH`, `SET SESSION`, transactions, `CALL` and
+maintenance procedures, is refused by the tool before the engine sees it.
+Administration goes through Flight SQL or Trino HTTP, where the operator
+expects it.
+
+Keep `allow_writes = false` for analytics assistants. For automation requiring
+writes, use a separate deployment/configuration and narrowly scoped source
+roles where operational isolation is required.
+
+Every statement a tool runs carries a deadline, `request_timeout_secs`
+(default 75 s, below the minute and a half most MCP clients wait before they
+retry). Past it the statement is cancelled, its query record reads
+`QUERY_ABANDONED`, and the tool answers with the deadline and the two ways
+out: a partition predicate or a `LIMIT`, or a longer deadline. Without this an
+agent that gave up and retried left the first attempt running to
+`query.timeout_secs` beside the second; on two thousand-partition snapshot
+tables that held the coordinator for half an hour. `0` leaves only the query
+timeout. A caller that disconnects mid-statement is treated the same way: the
+work stops and the record says the caller left.
+
+Results are structured JSON and text content. `max_result_rows` and
+`max_response_bytes` bound model context consumption; `truncated` reports when
+the result was cut. Prefer aggregation and explicit `LIMIT` clauses.
+
+The row cap is also pushed into the engine. A plain query without its own
+`LIMIT`, `FETCH` or `FOR` clause reaches the coordinator as
+`... LIMIT max_result_rows + 1`, so a `SELECT *` over a large table plans a
+bounded scan instead of collecting the whole result and keeping the first
+thousand rows. When that cap fires, `total_rows` reads `max_result_rows + 1`,
+meaning "more than the cap", not the true row count; `truncated` is still
+`true`. Statements that carry their own bound, `SHOW` statements and
+`explain_query` are passed through unchanged.
+
+### `describe_schema`: one schema per call
+
+A catalog crawler that runs `describe_table`, `get_table_stats` and
+`explain_query` per table pays three round trips and three sessions for every
+table; over a 600-table Glue catalog that is the crawl time. `describe_schema`
+does the same work server-side in one call:
+
+```json
+{"name": "describe_schema", "arguments": {
+  "catalog": "glue", "schema": "sales",
+  "include_stats": true, "include_queryability": true,
+  "page_size": 200, "page_token": "orders"}}
+```
+
+```json
+{"catalog": "glue", "schema": "sales", "total_tables": 412, "truncated": true,
+ "next_page_token": "shipments",
+ "tables": [
+  {"name": "orders_v", "table_type": "view", "source": "view",
+   "columns": [{"name": "month", "data_type": "Utf8", "nullable": true, "ordinal": 1}],
+   "row_count": null, "size_bytes": null, "snapshot_id": null,
+   "stats_error": "...", "queryable": false,
+   "queryability_error": "Schema error: No field named tag"},
+  {"name": "payments", "table_type": "table", "source": "hive_external",
+   "columns": [{"name": "id", "data_type": "Int64", "nullable": false, "ordinal": 1,
+                "comment": "payment id"}],
+   "row_count": 128400, "size_bytes": 73400320, "snapshot_id": null, "queryable": true}
+ ]}
+```
+
+It is composed of the statements the single-table tools issue, so it is never
+looser than they are: `SHOW TABLES` lists what the caller may see (Hive roots
+include Athena views; Iceberg REST catalogs include their views), `SHOW COLUMNS
+FROM` per table drops what policy restricts exactly as `describe_table` does,
+`SHOW STATS FOR` reads the Iceberg snapshot summary or the Hive table's
+metastore parameters and never scans, and `EXPLAIN SELECT * FROM t LIMIT 0`
+resolves and plans the table without running it and without listing its
+storage: resolution is where a Hive table's format, SerDe, location and
+column types are checked and where a view's SQL is planned, and the zero
+limit is eliminated before any scan is built. (`LIMIT 1` listed every table's
+S3 prefix on every call, half a second warm and a hang with expired
+credentials, so `include_queryability` over 40 tables cost 5 s; it now costs
+what the flag-less call costs.) `queryable` therefore means "SQE can resolve
+and plan this table"; whether storage answers is the `object_store` entry of
+`list_catalogs`. The table kind comes from one `SHOW VIEWS FROM
+<catalog>.<schema>` per call and is best effort: one listing of that schema,
+where `information_schema.tables` would enumerate every schema of the catalog
+(12 s cold on a Glue catalog of a hundred databases). On a Hive root the
+metadata statements behind each table (`SHOW COLUMNS`, `SHOW STATS`, `SHOW
+CREATE TABLE`) answer from the same manifest cache the planner uses, so a
+warm crawl pays no metastore round trip per table. Per-table statements run with bounded
+concurrency (eight at a time); one failing table records its `error`,
+`stats_error` or `queryability_error` and the call continues. Each of those
+statements also has a 20 s deadline of its own: a Hive table's stats and plan
+touch object storage, and with the engine's credentials expired those calls
+waited rather than failed, so one page over 25 tables hung indefinitely with
+either flag on. A statement past its deadline records the timeout on its
+field (with a pointer to the `list_catalogs` diagnostics) and the page comes
+back. Those statements
+take the caller's concurrency permits but not a share of
+`query.per_user_memory_budget`: `SHOW`, `DESCRIBE` and `EXPLAIN` (without
+`ANALYZE`) never execute a scan, so admission reserves no execution memory for
+them. Before that exemption the defaults (1GB budget, 256MB per query) admitted
+four metadata statements per user and refused the rest with a memory error. Pages are by table name
+(`page_size` default 200, at most 500), and `max_response_bytes` can shorten a
+page further, in which case `next_page_token` points at the first table that
+did not fit. `properties` and column-level statistics are not included.
+
+### Functions available to agents
+
+What an agent can rely on through `execute_sql_readonly`, measured on a
+release build against Glue-backed Hive tables (Parquet, every column type
+below present) on 2026-09-16. Each statement here ran and returned what it
+says; timings were 0.5 to 2.5 s per statement on a laptop, dominated by the
+S3 listing every plan of a Hive table pays.
+
+**Hashing for privacy-preserving identity linking.** Three spellings work
+on `Utf8` and `Utf8View` columns alike:
+
+```sql
+SELECT sha256(lower(email)) AS h FROM glue.crm.customers LIMIT 1;
+-- Utf8: 64 hex characters
+
+SELECT digest(email, 'sha256') AS h FROM glue.crm.customers LIMIT 1;
+-- Binary: base64 in the JSON result; wrap in encode(..., 'hex') for text
+
+SELECT sha256(lower(arrow_cast(email, 'Utf8View'))) FROM glue.crm.customers LIMIT 1;
+```
+
+`sha256()` is SQE's own function and is plain, unkeyed SHA-256. It is not
+the function HASH column masks use: those run HMAC-SHA256 under
+`[policy] mask_key` and cannot be called from SQL, so a query cannot
+reproduce masked values by hashing candidates. Overlap between two hash
+sets:
+
+```sql
+SELECT COUNT(*) FROM (
+  SELECT DISTINCT sha256(lower(email)) AS h FROM glue.crm.customers WHERE email IS NOT NULL
+  INTERSECT
+  SELECT DISTINCT sha256(lower(email))      FROM glue.sales.leads   WHERE email IS NOT NULL
+);
+```
+
+The `IS NOT NULL` matters: `sha256(NULL)` is `NULL`, `DISTINCT` keeps one
+`NULL` row per side, and `INTERSECT` treats `NULL` as equal to `NULL`, so
+two sets that share no value still report an overlap of one without the
+filter (verified). Under policy, a column masked with `MASK_HASH` already
+arrives as the keyed hex digest, so `sha256(lower(col))` hashes that digest:
+still deterministic within the deployment, still an overlap signal, but not
+comparable to a hash of the raw value elsewhere. A nullified column is
+`NULL` for every row and drops out of the count entirely with the filter
+above. Restricted columns keep their name and are `NULL` too.
+
+**Cardinality.** `COUNT(DISTINCT col)` and `approx_distinct(col)` both work
+for every column type the crawler meets: `Boolean`, `Int32`, `Int64`,
+`Decimal128(p, s)` at every precision tried, `Date32`, `Timestamp(µs)`,
+`Utf8`, `Utf8View`, and `List` and `Struct` columns as well. Exact and
+approximate agreed to within 1 percent on the columns measured (for
+example 950,704 exact against 934,606 approximate on an `Int64` key).
+`approx_distinct` returns `UInt64`; `COUNT(DISTINCT)` returns `Int64`. One
+statement can carry both for several columns:
+
+```sql
+SELECT approx_distinct(id), approx_distinct(email), approx_distinct(created_at)
+FROM glue.crm.customers;
+```
+
+**Row counts without a scan.** `get_table_stats` is `SHOW STATS FOR`. For an
+Iceberg table the summary row's `row_count` and `data_size` come from the
+current snapshot. For a Hive table they come from the metastore's table
+parameters (`numRows` / `recordCount`, `totalSize`): present after a Glue
+crawler or `ANALYZE`, absent (`NULL`) on a table Trino or Athena wrote, which
+carries `totalSize = -1`; in that case SQE reports the byte size its planner
+listed and leaves `row_count` `NULL`, and `COUNT(*)` is the exact answer
+(metadata-only on Parquet, half a second on a 1.4 M row table). The same
+numbers ride on `describe_schema` with `include_stats`.
+
+**A planner limit to know about.** A correlated scalar subquery in the
+select list, including one that references a CTE alias, plans and runs:
+
+```sql
+WITH s AS (SELECT id, primary_role_id FROM glue.hr.employees LIMIT 20)
+SELECT s.*, (SELECT COUNT(*) FROM glue.hr.roles o
+             WHERE o.id = s.primary_role_id) AS n
+FROM s;
+```
+
+The same shape with `DISTINCT`, `GROUP BY`, `ORDER BY ... LIMIT` or a join
+inside the CTE, two such subqueries, or `s.*` over a wide table with struct
+and list columns all ran. What DataFusion cannot decorrelate is a
+correlation that is not an equality on outer columns, for example
+`WHERE o.pk = s.a AND o.pk <> s.b`; it fails with `Physical plan does not
+support logical expression ScalarSubquery`. Rewrite that as a pre-aggregated
+CTE joined on the key.
+
+## Limits and exposure
+
+Every number below is the default from `McpConfig` and `RateLimitConfig`.
+Change them in `sqe.toml` under `[mcp]` and `[rate_limit]`.
+
+Response size. A tool response carries at most `max_result_rows` rows
+(1000) and `max_response_bytes` of JSON (2 MiB). A query without its own
+`LIMIT` gets the row cap appended, so `truncated: true` means "more than the
+cap", not "page for the rest". One string cell is cut at 64 KiB with a
+`...[truncated N bytes]` marker. `sample_rows` returns at most 100 rows and
+`describe_schema` pages at 200 tables, 500 at most. The request body is
+capped at 1 MiB by the router.
+
+Deadline. `request_timeout_secs` (75) bounds one statement run by a tool
+call; past it the statement is cancelled and the tool reports the deadline.
+The whole HTTP request gets that value plus 15 seconds, after which the
+server answers 504. Zero leaves only `query.timeout_secs`.
+
+Rate limits. `[rate_limit]` is off by default and required under
+`production_mode`. Enabled, it charges one query per `execute_sql_readonly`,
+`sample_rows`, `refresh_metadata` and change call against
+`per_user_queries_per_minute` (60), keyed on peer address plus user so a
+static or anonymous deployment is not one shared bucket, and against
+`global_queries_per_minute` (1000). The metadata tools, `explain_query`
+included, charge `metadata_per_user_per_minute` (120) once per call. Both denials come back as a tool
+failure with `error: rate_limited` and `retry_after_seconds`, so the agent
+waits instead of retrying blind. Credential presentations are limited before
+any provider runs: `auth_attempts_per_minute` (10) with a burst of
+`auth_burst` (20) per peer, answered with HTTP 429 and a `Retry-After`
+header. The metadata `SHOW` statements behind `search_tables` and
+`describe_schema` also share a process-wide ceiling of 16 in flight.
+
+Bind address. With `port = 0` the endpoint rides the web listener. With a
+dedicated port, an empty `bind_address` means `127.0.0.1` under
+`[mcp.auth] mode = "anonymous"` and `0.0.0.0` otherwise. Anonymous mode also
+pulls the health and metrics listeners onto loopback unless `bind_address`
+names another interface. Anonymous with `--allow-all-buckets` off loopback is
+refused at startup.
+
+Denylist. The read tools accept one statement, classified by the SQL parser
+before execution. Refused before the query handler sees them: DDL, DML,
+grants, secrets and session changes; `SELECT INTO`, `WITH ... INSERT` and
+quoted paths in `FROM`; every table function except the catalog-scoped
+Iceberg metadata TVFs (`table_snapshots`, `table_manifests`,
+`table_history`, `table_files`, `table_partitions`, `table_refs`); the
+`system` catalog, whose runtime views carry every client's SQL; and
+`information_schema.df_settings`, which lists the engine's runtime settings,
+spill path included. The rest of `information_schema` stays readable.
+
+Kubernetes. The Helm chart's `config.mcp` block renders `[mcp]`, a `mcp`
+container port (8098) and, with `ingress.enabled`, a `/mcp` path on the
+coordinator host. That path requires `ingress.tls`; the chart refuses to
+render it over plain HTTP, and it refuses `auth.mode = "anonymous"`
+outright. `networkPolicy.enabled` denies all ingress to the coordinator
+except the listed ports, and `networkPolicy.mcpFrom` names the peers allowed
+to reach the MCP port; an empty list allows any source on that port. Static
+principals take their token from an environment variable named in
+`token_env`, injected through `existingSecret` or `extraEnv`, never a literal
+in values.
+
+## Error text
+
+A tool that fails returns `isError: true` with one text line. What that line
+says depends on who can act on it. A user error (syntax, an unknown table or
+column, a denial, a cancelled query) is about the caller's own statement and
+is returned verbatim, as it is on Flight SQL and Trino. A system error (object
+store, catalog, execution, timeout) is returned as the error class's generic
+sentence plus an `error_id`:
+
+```text
+Storage operation failed [STORAGE_ERROR, error_id 3f9c1a7e2b40]. The server log has the detail under that id.
+```
+
+The full text, which carries bucket names, object keys, hostnames and region or
+account hints, is written to the coordinator log at WARN under that
+`error_id`. An agent transcript is not the place for it. Two system texts stay
+verbatim because the hint in them is the fix: the Arrow decimal overflow (a
+value and a precision, with the pointer at the metastore definition) and a
+rate-limit denial (its retry-after). The `detail` of `list_catalogs`
+diagnostics and the per-table `error` of `describe_schema` follow the same
+rule.
+
+## Catalog scoping
+
+Two settings decide which catalogs an agent works in.
+
+`default_catalog` and `default_schema` are set on every MCP session, so agents
+can write `SELECT * FROM orders` or `staging.orders` instead of qualifying
+every name. In static mode a principal's own `default_catalog` and
+`default_schema` win over the endpoint-wide values, which pins one agent to
+one warehouse. The same defaults drive `information_schema` qualification and
+the write gate below. A `default_schema` without a catalog to resolve in is a
+startup error.
+
+`write_catalogs` is the allowlist for `execute_sql_change`. When set, the
+statement's target must resolve to a listed catalog, compared without regard
+to case. Targets are what the parser exposes: the table of an `INSERT`,
+`UPDATE`, `DELETE`, `MERGE`, `CREATE TABLE`, `CREATE TABLE AS`, `ALTER TABLE`,
+`DROP`, `TRUNCATE` or `COMMENT`, the view of `CREATE VIEW`, the schema of
+`CREATE SCHEMA` or `DROP SCHEMA`. Sources are reads, so an
+`INSERT INTO iceberg.t SELECT * FROM lake.raw` is a write to `iceberg` only;
+policy enforcement covers the read side as it does everywhere. An unqualified
+target resolves through the session default catalog. While the gate is active,
+a target that cannot be resolved is refused, and so is a statement kind with no
+parser-visible target: `CALL` procedures, grants, policy DDL. Run those over
+Flight SQL or Trino, as the user, not from an agent.
+
+Hive external tables (`[[hive.roots]]`) get one extra rule, whether or not
+`write_catalogs` is set. Iceberg writes are authorised twice: SQE's policy, and
+Polaris vending credentials for that user. A Hive root has no per-user
+credentials; SQE reads and writes it with its own storage credentials, so an
+agent writing there acts as the engine. That needs an explicit opt-in: the
+Hive root's catalog name must appear in `write_catalogs`, and SQE logs a
+warning at startup when it does. With no `write_catalogs` and no Hive roots,
+the change tool behaves as before.
+
+## Hive tables over MCP
+
+A Glue catalog is usually wider than what one agent should see. Scope the
+root to named databases with `--glue-database` (repeatable or
+comma-separated) or `databases = [...]` on the `[[hive.roots]]` entry:
+
+```bash
+sqe-server --glue-catalog glue --glue-database afas_raw,claude \
+  --allow-s3-prefix s3://lake/ --mcp-anonymous --mcp-port 8098
+```
+
+`list_schemas`, `search_tables`, `describe_schema` and `information_schema`
+see only those databases, and a table anywhere else is not found rather than
+denied, so the scope leaks no names. Names are folded to lower case, which is
+how Glue stores them, and each is checked against the catalog at the first
+listing: a database that does not exist is logged at WARN and not listed,
+instead of appearing as a schema with no tables. This is a visibility scope,
+not authorization: every caller of the endpoint sees the same set. Per-user
+access on top of it is the identity provider plus the Ranger engine, as for
+any other catalog.
+
+Hive external tables are visible through every read tool, with the same
+row filters and column masks as over Flight SQL: the manifest's policy key is
+`<root>.<database>`, and the read tools go through the same query handler.
+With the Ranger engine, a Hive table also needs a Ranger access policy
+granting `select` before any tool lists or reads it; an ungranted table is
+"not found" to `list_tables`, `describe_table` and the query tools alike.
+Two things differ from an interactive session.
+
+- Only `[[hive.roots]]` catalogs are reachable. `ATTACH ... TYPE hive_external`
+  is a session statement, and an MCP session lives for one request, so an
+  attached catalog is gone before the next call. Configure roots in the server
+  config instead.
+- `get_table_stats` reads Iceberg snapshot metadata and returns a tool error
+  for a Hive table. `describe_table`, `get_table_ddl` and `execute_sql_readonly`
+  work on both.
+
+## Audit attribution
+
+Every tool call runs as the authenticated user, and the audit record says so
+in `actor.user`. It also says which agent asked. The session's client label,
+the same field Trino HTTP fills from `X-Trino-Source`, is set to:
+
+```text
+mcp:<tool>:<client name>/<client version>
+```
+
+The client name and version come from the `clientInfo` the MCP client sends on
+`initialize`. SQE answers `initialize` with an `Mcp-Session-Id` header; a
+client that echoes it on later requests gets that label on every call. The id
+is advisory. An unknown id, one from before a restart, one issued to a
+different identity, or one presented from a different client address than it
+was issued to is ignored, never rejected, and the label falls back to the
+request's `User-Agent`, then to the bare `mcp:<tool>` form. Labels are reduced
+to printable ASCII and cut at 64 bytes before they reach a log line.
+
+In the OCSF export the label is `actor.app_name`; in `system.runtime.queries`
+and the dashboard it is the `source` column. `whoami` returns the label the
+server resolved for the current request as `client`.
+
+The authentication rate limit is spent per `(peer IP, credential)` tuple, the
+same tuple the Trino and Basic paths use. The credential half is a SHA-256
+fingerprint of the bearer, so agents behind one proxy address get separate
+budgets and a token-rotating attacker does not.
+
+### Trace correlation
+
+A client that sends a W3C `traceparent` header makes the request span, the
+statement span below it and the audit record part of its own trace: the
+audit line's `trace_id` is the caller's. The response carries the same id
+back as `result._meta.trace_id` on every successful JSON-RPC result, so an
+agent's question and the engine's record of what ran can be joined without
+timestamps. A request without `traceparent` starts a fresh trace and returns
+that id. The propagation code is the one Flight SQL and Trino HTTP use.
+
+## Design references
+
+The design follows the MCP 2025-11-25 authorization requirements (OAuth 2.1,
+RFC 9728 protected-resource metadata, RFC 8707 resource indicators, discovery,
+and incremental scope challenges), Snowflake's read-only-by-default SQL tool,
+and Databricks' on-behalf-of-user governed SQL model:
+
+- <https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization>
+- <https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-mcp>
+- <https://docs.databricks.com/aws/en/agents/mcp-tools/databricks-sql>

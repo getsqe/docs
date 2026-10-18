@@ -10,13 +10,14 @@ Source: `sqe-sql/src/procedures.rs`. Handlers in `crates/sqe-coordinator/src/mai
 
 | Procedure | Origin | Required args | Optional args | Notes |
 |---|---|---|---|---|
-| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N`, `distributed => 'auto'\|'local'\|'require'`, `rewrite_all => true` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `rewrite_all => true` forces a rewrite of every file regardless of size or file count. `distributed => ...` overrides `[maintenance.distribution] mode` for this one call (see [Configuration](../deployment/configuration.md) and [Distributed compaction](../design-notes/distributed-compaction.md)); omit it to use the configured mode. A manual `CALL` commits with no extra snapshot properties; the auto-compaction scheduler (see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)) calls this same handler internally and stamps `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot it commits, so an autonomous compaction is attributable in the table's history while a manual one is not. |
-| `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. |
+| `system.rewrite_data_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `target_file_size_bytes => N`, `min_input_files => N`, `max_concurrent_file_group_rewrites => N`, `strategy => 'binpack'\|'sort'`, `sort_order => 'col ASC, ...'\|'zorder(a, b)'`, `delete_file_threshold => N`, `delete_ratio_threshold => R`, `distributed => 'auto'\|'local'\|'require'`, `rewrite_all => true` | Compacts small data files (delete-aware). Default target 512 MiB, min 5 files per group, max 4 concurrent groups. `strategy => 'sort'` sorts a whole partition by `sort_order` (a column list or `zorder(...)`) via a spillable DataFusion sort and rolls output at the target size, producing files with disjoint key ranges. `delete_file_threshold => N` also rewrites any data file with at least N delete files applying to it, even when it is already large. `delete_ratio_threshold => R` (0 < R <= 1) rewrites any data file whose deleted rows are at least that share of its rows, the trigger that works on format-version 3 deletion vectors. `rewrite_all => true` forces a rewrite of every file regardless of size or file count. `distributed => ...` overrides `[maintenance.distribution] mode` for this one call (see [Configuration](../deployment/configuration.md) and [Distributed compaction](../design-notes/distributed-compaction.md)); omit it to use the configured mode. A manual `CALL` commits with no extra snapshot properties; the auto-compaction scheduler (see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)) calls this same handler internally and stamps `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot it commits, so an autonomous compaction is attributable in the table's history while a manual one is not. |
+| `system.expire_snapshots` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP`, `retain_last => N` | Drops old snapshots. `older_than` and `retain_last` combine: a snapshot must be older than `older_than` and beyond the `retain_last` window before it is removed. First drops the `sqe-txn-*` branches a crashed coordinator left behind (see [Transactions](dml.md#transactions)); the result's `detail` reports `txn_branches_dropped`. |
 | `system.remove_orphan_files` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `older_than => TIMESTAMP` | Deletes files under the table prefix not referenced by any live snapshot. Default `older_than` is 3 days ago, to avoid racing with in-flight writes. |
 | `system.rewrite_manifests` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | Consolidates many small manifest files into fewer larger ones. Speeds up planning on large tables. |
 | `system.suggest_bloom_filter_columns` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `history_limit => N` | SQE-specific. Walks the last N finished queries (default 1000), counts equality predicates per column, returns ranked suggestions for `write.parquet.bloom-filter-columns`. |
 | `system.table_health` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | - | SQE-specific (auto-compaction maintenance subsystem, see [Maintenance (auto-compaction)](../deployment/configuration.md#maintenance-auto-compaction)). Read-only compaction-debt report: live/small file counts, avg/p50 file size, delete-file and delete-heavy counts, eligible bin-pack groups, estimated rewrite bytes, last compaction snapshot, and whether the table has opted into the maintenance scheduler. Never rewrites anything, and available regardless of `maintenance.mode`. |
 | `system.refresh_catalog_cache` | `sqe-sql` + `sqe-coordinator` | - | - | SQE-specific. Table-less. Drops the calling session's own cached `SessionContext`, so the next query re-enumerates catalogs and sees a catalog created out-of-band (for example by the platform) without waiting out the session-cache TTL. Self-scoped: it touches only the caller's view and no process-global cache, needs no write privilege, and has no cross-tenant effect. Returns one row (`scope`, `status`). The global, admin-gated equivalent (which also drops the shared REST-catalog cache, covering catalog rebinds) is the `POST /api/v1/catalogs/refresh` endpoint on the health port (see [Web UI and admin endpoints](../operations/web-ui.md)). |
+| `system.drop_table` | `sqe-sql` + `sqe-coordinator` | `table => 'ns.t'` | `purge => true\|false` | Drops the table from the catalog. Without `purge` (the default) the files stay on the object store, so the table can be registered again with `system.register_table`. With `purge => true` SQE then deletes everything under the table's location with the caller's own storage credentials, synchronously, and writes an audit event. Returns one row (`table_identifier`, `purge`, `status` = `dropped` or `purged`). See the purge refusals under [Safety notes](#safety-notes). |
 
 ## Comparison to other engines
 
@@ -116,6 +117,35 @@ therefore rewrites broadly, since one equality delete can apply to many files.
 The option is off by default and is a no-op under `strategy => 'sort'`, which
 already rewrites the whole partition.
 
+On a format-version 3 table (the default for new tables) position deletes are
+deletion vectors: each data file has at most one, and every `DELETE` replaces
+it. A threshold above 1 is therefore never reached by SQE's own deletes, however
+many rows they remove; only equality deletes from other writers still add up.
+On V3, use `delete_ratio_threshold` instead. It rewrites a data file once its
+deleted rows reach that share of its rows:
+
+```sql
+CALL system.rewrite_data_files(
+    table => 'analytics.events',
+    delete_ratio_threshold => 0.3
+);
+```
+
+The share is the deletion vector's cardinality over the data file's row count,
+so a file with 3 of its 10 rows deleted qualifies at 0.3. It also counts V2
+position delete files written for a single data file. When a file has both
+kinds, only the deletion vector counts, because it already holds the older
+deletes. Equality deletes and position delete files that span several data
+files are not counted, because their row count does not say how many of this
+file's rows they remove; `delete_file_threshold` still sees them. The value must
+be greater than 0 and at most 1. 0.3 is a reasonable start; Spark's
+`delete-ratio-threshold` uses the same default. Both thresholds can be given in
+one call, and a file meeting either one is rewritten. Like the count, the ratio
+is off by default and is a no-op under `strategy => 'sort'`.
+
+`rewrite_all => true`, or a count threshold of 1, still rewrites every data
+file that has any deletes.
+
 ### Override the distribution mode for one call
 
 `distributed => 'auto'|'local'|'require'` overrides
@@ -191,7 +221,7 @@ Returns one summary row:
 Column notes:
 
 - `small_files` counts live data files below `[maintenance.compaction].target_file_size_bytes` (default 512 MiB).
-- `eligible_groups` / `est_rewrite_bytes` report pure bin-pack debt: groups that meet `min_input_files` on file count alone. `delete_heavy_files` is a separate signal, files with at least `delete_file_threshold` delete files applying to them. A later `rewrite_data_files(delete_file_threshold => N)` call rewrites the union of both sets, so treat the two counts as additive, not `eligible_groups` already including delete-heavy files.
+- `eligible_groups` / `est_rewrite_bytes` report pure bin-pack debt: groups that meet `min_input_files` on file count alone. `delete_heavy_files` is a separate signal, files with at least `delete_file_threshold` delete files applying to them, or a deleted-row share of at least `[maintenance.compaction] delete_ratio_threshold`. `table_health` reads both thresholds from `[maintenance.compaction]`, not from a CALL argument. A later `rewrite_data_files(delete_file_threshold => N)` call rewrites the union of both sets, so treat the two counts as additive, not `eligible_groups` already including delete-heavy files.
 - `last_compaction_snapshot_ms` is always `NULL`. Active-mode compactions do stamp `sqe.maintenance.job-id`/`principal`/`trigger` onto the snapshot they commit (see the `system.rewrite_data_files` note above), but `table_health` does not yet read that snapshot property back; check the table's snapshot history directly for compaction attribution until a later phase wires this column up.
 - `maintenance_enabled` reflects the `sqe.maintenance.enabled` table property, i.e. whether the advisory/active scheduler would even consider this table. It does not mean a rewrite ran: advisory mode never mutates, and active mode may still find no eligible compaction debt on a given tick.
 
@@ -254,17 +284,17 @@ Order matters: expire snapshots before removing orphan files (otherwise files re
 
 ## Permissions
 
-Procedures inherit the calling user's grants on the target table:
+Procedures are gated in three tiers, by blast radius. Polaris grants on the target table still apply underneath every tier.
 
-- `system.rewrite_data_files`, `system.rewrite_manifests` need `MODIFY` (writes new files, commits a snapshot).
-- `system.expire_snapshots`, `system.remove_orphan_files` need `MODIFY` and `DROP` (alters retention, deletes files).
-- `system.suggest_bloom_filter_columns` is read-only against query history; `SELECT` on the table is enough.
-- `system.table_health` is read-only against the table's live metadata; `SELECT` on the table is enough. It bypasses the write-privilege gate entirely, unlike every other procedure in this table.
-- `system.refresh_catalog_cache` is self-scoped (it refreshes only the caller's own session view) and bypasses the write-privilege gate, like `system.table_health`. A global flush across all sessions is intentionally not a SQL procedure: use the admin-gated `POST /api/v1/catalogs/refresh` endpoint instead.
+| Tier | Procedures | Who may call |
+|---|---|---|
+| Read-only | `system.table_health`, `system.suggest_bloom_filter_columns`, `system.refresh_catalog_cache`, `system.purge_orphan_locations(dry_run => true)` | Anyone who can read the table's metadata. |
+| Table write | `system.rewrite_data_files`, `system.rewrite_manifests` | Any session whose roles are not explicitly read-only (a role starting with `read` or `select`, or containing `readonly`, with no `write`, `admin` or `owner` role beside it). The commit runs with the caller's token, so Polaris `MODIFY` is the backstop. The maintenance scheduler's own session is admitted here. |
+| Admin | `system.expire_snapshots`, `system.remove_orphan_files`, `system.purge_orphan_locations(dry_run => false)`, `system.drop_table`, `system.register_table`, `system.set_current_snapshot`, `system.rollback_to_snapshot`, `system.reproject_column_tags` | One of the roles in `[auth] admin_roles`. Sessions with no roles are denied, and so is the scheduler's session. With no admin roles configured this tier is closed. |
 
-A user without the right grant gets a clear "policy denied" error instead of a generic execution failure.
+The admin tier exists because these procedures delete data files or history without a catalog commit Polaris could refuse, or move the table's main branch for everyone. They are administrative in Spark and Trino as well.
 
-When no OPA / Cedar policy store is wired, an engine-level heuristic acts as the last line of defence. A session is treated as read-only when any of its roles matches `read*`, `select*`, or contains `readonly`, and no role contains `write`, `admin`, or `owner`. Read-only sessions are denied every maintenance procedure and the attempt is recorded in the audit log with `status = "denied"`. A policy store overrides this heuristic once configured.
+A denied call fails with `403 Forbidden` and is recorded in the audit log as `AdminGateDenied`.
 
 ## Safety notes
 
@@ -273,6 +303,7 @@ When no OPA / Cedar policy store is wired, an engine-level heuristic acts as the
 - **`rewrite_data_files` rewrites entire data files**, not row groups. Two consecutive calls can churn the same files; rely on the `min_input_files` floor (default 5) to keep churn bounded.
 - **`rewrite_data_files` is delete-aware on Merge-on-Read tables.** It reads each file group through the Iceberg scan, so position and equality deletes are applied during the rewrite and deleted rows never reappear. The compacted output is pinned to the sequence number of the snapshot it read, so an equality delete another writer commits mid-compaction still applies to the compacted files. Fully-covered position delete files are dropped in the same commit; equality deletes are left to age out via `expire_snapshots`. It groups files per partition, so partitioned tables consolidate within each partition.
 - **`rewrite_data_files` retries on conflict.** A concurrent writer that commits between the read and the commit produces a retryable conflict; the procedure re-reads and retries with backoff a bounded number of times before surfacing the conflict.
+- **`drop_table(purge => true)` cannot be undone.** It refuses, before dropping anything, when the table sets `gc.enabled=false`; when its location is a bucket root; when a `write.data.path`, `write.metadata.path` or similar property, or the current metadata file, points outside the location; or when any other table in the catalog uses the same location, a location inside it, or one containing it (for example a second identifier created with `register_table`). Drop the other table first, or drop without purge. SQE does not use the REST catalog's own purge flag, which in Polaris needs `DROP_WITH_PURGE_ENABLED` and deletes later with the catalog's credentials. If the catalog drop succeeds but the file delete fails, the error names the prefix to delete by hand.
 - **Run procedures in a quiet window.** A concurrent writer that commits mid-run can cause `rewrite_data_files` to return a retryable error. The other procedures tolerate concurrency and reconcile against the live snapshot.
 
 ## Commit failures

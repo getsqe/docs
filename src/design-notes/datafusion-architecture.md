@@ -32,7 +32,7 @@
 │  PolicyEnforcer trait (no-op now, OPA/Cedar later)          │
 │  Metrics Collector (Prometheus)                             │
 └──────────────────────────┬──────────────────────────────────┘
-                           │  Arrow Flight (plan fragments)
+                           │  Arrow Flight (ScanTasks; distributed scan)
               ┌────────────┼────────────┐
 ┌─────────────▼──┐  ┌──────▼───────┐  ┌─▼──────────────┐
 │   Worker Node   │  │  Worker Node  │  │  Worker Node   │
@@ -123,16 +123,29 @@ Coordinator (Scheduler)
   ├── Runs DataFusion optimizer (predicate pushdown, projection pruning)
   ├── Converts to PhysicalPlan
   ├── Partitions by Iceberg manifest/data file groups
-  ├── Assigns fragments to workers (locality-aware if on-prem)
-  └── Streams results back via Arrow Flight
+  ├── Assigns scan tasks to workers (least reserved load, path affinity)
+  └── Runs joins, aggregates and sorts over the returned Arrow streams
 
 Worker (Executor)
-  ├── Receives PhysicalPlan fragment + session context (bearer token)
+  ├── Receives a ScanTask (file list + projection + predicate + limit) and the bearer token
   ├── Opens iceberg-rust TableProvider with user's token
-  ├── Executes scan → filter → project → aggregate
+  ├── Executes scan → filter → project
   ├── Streams Arrow RecordBatches back to coordinator
   └── Reports metrics (rows scanned, bytes read, duration)
 ```
+
+**Executed topology: distributed scan, coordinator-side everything else.**
+A worker is handed a scan, not a plan fragment. Joins, aggregates and sorts all
+run on the coordinator, and workers never exchange data with each other. There
+is no shuffle on any query path today. The `DoExchange` shuffle intake and its
+spillable partition buffers were feature-gated, never enabled by any build,
+and were deleted in September 2026; git history keeps them for the stage-based
+execution roadmap. The worker answers `DoExchange` with `Unimplemented` and
+holds no state keyed by a caller-supplied query or stage id. The planner side (stage decomposition, shuffle writer and reader nodes,
+range-partitioned distributed sort, distributed aggregate, broadcast and
+shuffle-hash join rules) had no caller in any binary and was removed from
+sqe-planner; git history before 2026-09-11 keeps it. Read any description of
+stage-based MPP in this repository as roadmap, not as running code.
 
 **Scaling model:**
 - Workers are stateless, horizontally scalable (K8s Deployment)
@@ -294,8 +307,8 @@ sovereign-query-engine/
 - Manifest caching for metadata performance
 - Audit logging (structured JSON query log)
 
-### Phase 3: Distributed execution (4-6 weeks)
-- Ballista-derived scheduler + worker model
+### Phase 3: Distributed scan (4-6 weeks)
+- Bespoke scheduler + stateless scan workers (shipped as scan offload, not plan-fragment execution; see 2.3)
 - Auth context propagation via Flight metadata
 - Partition-aware query splitting (Iceberg manifest-level)
 - Multi-worker execution with result aggregation
