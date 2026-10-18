@@ -26,7 +26,7 @@ DROP SCHEMA staging CASCADE;
 | `CREATE TABLE t (col TYPE [DEFAULT expr], ...)` | `sqlparser-rs` + `sqe-sql` + `sqe-coordinator` | Iceberg V3 column defaults supported. | yes | yes | yes | yes |
 | `CREATE TABLE t (...) PARTITIONED BY (transform(col), ...)` | `sqe-sql/partition.rs` | Partition transforms: `bucket(N, col)`, `truncate(N, col)`, `year(col)`, `month(col)`, `day(col)`, `hour(col)`, identity (just `col`). | partial | - | yes | - |
 | `CREATE TABLE t AS SELECT ...` (CTAS) | `sqlparser-rs` + `sqe-coordinator` | Inferred schema; partitioning via `WITH (partitioning = ARRAY['day(ts)'])`. | yes | yes | yes | yes |
-| `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace. New snapshot replaces the table; old data files retained until `expire_snapshots`. | yes | yes | partial | yes |
+| `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace. In-place snapshot replace when schema and partitioning match (table keeps UUID, grants, history; properties not re-applied). Staged table + swap otherwise. Self-referencing replace safe (reads old snapshot before swap). | yes | yes | partial | yes |
 | `CREATE TABLE [IF NOT EXISTS] t LIKE other_table` | `sqlparser-rs` + `sqe-coordinator` | Copy schema only, no data. | yes | yes | yes | yes |
 
 ```sql
@@ -45,11 +45,13 @@ SELECT day(occurred_at) AS d, count(*) AS n
 FROM analytics.events GROUP BY 1;
 ```
 
+A column `DEFAULT` takes a literal and makes the table format-version 3. An `INSERT` with a column list and a `MERGE ... WHEN NOT MATCHED THEN INSERT` write the default into every column they omit; an explicit `NULL` is written as NULL. Defaults on `BINARY`, `FIXED` and `UUID` columns are refused on INSERT; name the column and give its value.
+
 ## Schema evolution
 
 | Statement | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column. Existing rows get the default (V3) or NULL (V2). | yes | yes | yes | yes |
+| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column. Rows written before the ALTER read the default, and a later INSERT or MERGE INSERT that omits the column writes it (V3). | yes | yes | yes | yes |
 | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` | `sqlparser-rs` + `sqe-coordinator` | Logical drop. Field id retained in old data files. | yes | yes | yes | yes |
 | `ALTER TABLE t RENAME COLUMN old TO new` | `sqlparser-rs` + `sqe-coordinator` | Iceberg field id stays the same; only the name changes. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Tighten nullability. Fails if existing rows have NULL. | yes | yes | yes | yes |
@@ -166,19 +168,36 @@ object and a later implementation, or another engine, can honour it.
 
 | Statement | Origin | Notes |
 |---|---|---|
-| `DROP TABLE [IF EXISTS] t [PURGE]` | `sqlparser-rs` + `sqe-coordinator` | `PURGE` deletes data files immediately; default keeps the metadata so `system.remove_orphan_files` can clean later. |
+| `DROP TABLE [IF EXISTS] t [PURGE]` | `sqlparser-rs` + `sqe-coordinator` | Removes the table from the catalog and keeps its data files. `PURGE` also deletes everything under the table's location once the catalog drop succeeds; it runs `CALL system.drop_table(table => 't', purge => true)`, so it needs an admin role (`auth.admin_roles`) and is refused, with nothing dropped, when another table shares the location. Hive tables refuse `PURGE`. |
 | `DROP VIEW [IF EXISTS] v` | `sqlparser-rs` + `sqe-coordinator` | Standard. |
 | `DROP SCHEMA [IF EXISTS] s [CASCADE\|RESTRICT]` | `sqlparser-rs` + `sqe-coordinator` | `CASCADE` drops contained tables. |
 
 ## Iceberg V3 type system
 
-These types only exist in format-version 3. Adding one to a CREATE TABLE auto-bumps the table to V3.
+These types only exist in format-version 3, the default for new tables. A `TIMESTAMP_NS` or `VARIANT` column, or a `DEFAULT`, makes the table V3 even when the configured default is 2.
 
 | Type | Notes |
 |---|---|
 | `TIMESTAMP_NS`, `TIMESTAMP_NS WITH TIME ZONE` | Nanosecond precision timestamps. Arrow `Timestamp(Nanosecond, ...)`. |
-| `GEOMETRY`, `GEOGRAPHY` | Stub types in V3; SQE accepts them in CREATE but does not yet provide spatial functions. |
+| `VARIANT` | Semi-structured value (object, array, string, number, boolean, null) in the Iceberg variant binary encoding. See [VARIANT](#variant) below. |
+| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Top-level only; a nested unknown field is refused. |
 | Default values via `DEFAULT expr` | Existing rows in older snapshots inherit the default at read time. |
+
+### VARIANT
+
+```sql
+CREATE TABLE events (id BIGINT, payload VARIANT);
+INSERT INTO events VALUES (1, '{"user": "a", "tags": [1, 2]}'), (2, '"plain text"'), (3, NULL);
+```
+
+- **Writes parse text as JSON.** A string written to a `VARIANT` column is parsed as a JSON document: `'{"a": 1}'` stores an object and `'42'` stores a number. To store a JSON string, quote it: `'"text"'`. Text that is not valid JSON fails the statement; it is never stored as NULL. Other column types (numbers, booleans, structs, lists) are stored as the variant of their value.
+- **Reads return JSON text.** Clients have no variant type. The Trino protocol reports the column as `json` and sends each value as JSON text; Flight SQL / ADBC / JDBC return it as a UTF-8 string. `DESCRIBE` and `information_schema.columns` report `variant`, and `SHOW CREATE TABLE` prints `VARIANT`.
+- **The table becomes format-version 3.** `CREATE TABLE` and CTAS with a variant column create a V3 table. `ALTER TABLE ... ADD COLUMN c VARIANT` is refused on a V2 table. V3 tables can be read by Spark 4.0 with Iceberg 1.10 or later, and by Trino 481 or later; older readers cannot open them.
+- **`JSON` is a variant on a V3 table.** A `JSON` column, also inside a `STRUCT` or `ROW`, is stored as `VARIANT` when the table is format-version 3 and as a string otherwise. New tables are V3 by default (`catalog.default_table_format_version = 3`), so a plain `CREATE TABLE t (doc JSON)` stores a variant. A table is V2 when it asks for it with `WITH ('format-version' = '2')`, the Trino form `WITH (format_version = 2)` or `TBLPROPERTIES ('format-version' = '2')`, or when the configured default is 2; its `JSON` columns are strings, which readers without V3 support (Trino < 481, Spark < 4.0, Iceberg < 1.10) can open. `ALTER TABLE ... ADD COLUMN c JSON` adds a variant to a V3 table and a string to a V2 one. Asking for format-version 1 or 2 on a table with a V3-only column is an error.
+- **JSON functions read a variant.** `json_extract`, `json_extract_scalar`, the `json_get_*` functions and the other `json*` functions take a variant as its JSON text, so the same query works on a V2 `JSON` string and a V3 variant.
+- **Existing JSON columns are not converted.** Iceberg does not allow evolving a `string` column to `variant`, so a column that holds JSON text stays a string. To convert one, copy it into a table declared with a `VARIANT` column, where the write parses each value: `CREATE TABLE t2 (id BIGINT, doc VARIANT); INSERT INTO t2 SELECT id, doc FROM t1;`.
+- **Shredded files are read, not written.** A variant another engine wrote shredded (Spark with `write.parquet.shred-variants=true`) reads as the same JSON text as an unshredded one, on the coordinator and on workers. SQE always writes unshredded variants, and it unshreds on read, so a shredded field gives no pruning or typed access.
+- **Not yet:** variant path functions (`variant_get`), writing shredded variants, and nested variants (inside a `ROW` or `ARRAY`) on Flight SQL, which arrive as the raw storage struct.
 
 ## What CREATE / ALTER does NOT cover
 

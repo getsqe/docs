@@ -153,8 +153,9 @@ secret meaningful. Characters that would otherwise break a URL, such as `@`,
 `:`, and `/`, are percent-encoded on the way in, so a password does not need
 pre-escaping.
 
-Requires one of the `sql`, `sql-postgres`, or `sql-sqlite` cargo features. A
-binary built without them reports which feature is missing.
+A `sqlite:` URL is served by the pure-Rust SQLite engine (`sql-sqlite-rs`,
+in the default build); every other scheme needs `sql-postgres` (sqlx). A
+binary built without the matching feature reports which one is missing.
 
 ## SHOW CATALOGS and SHOW SECRETS
 
@@ -172,12 +173,11 @@ exposed; the table is for inventory only.
 
 ## Authorization
 
-Out of the box, ATTACH and CREATE SECRET are open to any authenticated
-session. Lock them down through the same OPA / Cedar policy backend
-that gates GRANT and REVOKE: write a rule that denies
-`statement_kind == "attach"` for non-admin roles. The plan rewriter
-sees the statement before it reaches the registry, so a denied ATTACH
-errors at policy enforcement time, not at catalog build time.
+ATTACH, DETACH, CREATE SECRET, DROP SECRET, and SHOW SECRETS require
+an admin role from `[auth] admin_roles` (default `service_admin` and
+`catalog_admin`). Any other session gets a permission-denied error
+before the statement reaches the registry. An empty `admin_roles` list
+denies these statements to everyone.
 
 ## Lifecycle and persistence
 
@@ -275,6 +275,28 @@ Properties:
   declaration or `ATTACH`. `SHOW CATALOGS` lists statically-configured and
   already-discovered catalogs, not warehouses never yet referenced.
 
+## Metadata freshness under concurrent writers
+
+Each session plans against a cached list of a catalog's schemas and a cached
+list of each schema's tables, so that a dbt run does not ask Polaris for
+them on every statement. The caches follow writes in three ways:
+
+- DDL through SQE (`CREATE`/`DROP SCHEMA`, `CREATE TABLE`, CTAS, `INSERT`,
+  `DROP`/`RENAME TABLE`) drops the cached schema list of every session, and
+  drops every principal's table list for the schema it touched. A parallel
+  model on another connection sees the change on its next statement.
+- A statement naming a schema that is not in the cached list re-lists the
+  catalog. Re-listing happens at most once every 5 seconds per session; a
+  miss inside that window asks Polaris about that one schema instead, so a
+  schema created moments earlier by another coordinator replica, Spark or
+  Airflow is found rather than reported missing.
+- Table lookups always ask Polaris, so a new table is visible to the next
+  statement. Only listings (`information_schema.tables`, `SHOW TABLES`) read
+  the cached table list, refreshed when older than 5 seconds.
+
+Serializing dbt (`threads: 1`, Airflow `max_active_tasks=1`) is not needed
+for schema or table visibility.
+
 ## v1 limitations
 
 - No on-disk persistence. ATTACH does not survive a restart.
@@ -284,9 +306,8 @@ Properties:
 - No mTLS to attached REST catalogs. Bearer tokens only.
 - No KERBEROS for HMS. The HMS path uses the upstream Thrift client's
   default authentication.
-- Authorization is enforced through the policy backend (OPA / Cedar).
-  There is no built-in role check for ATTACH or CREATE SECRET out of
-  the box; operators wire it themselves through policy rules.
+- Authorization is a single admin-role check (`[auth] admin_roles`).
+  There is no finer per-catalog or per-secret permission.
 - The embedded CLI (`sqe-cli` ad-hoc mode) supports the same syntax
   as the cluster server. Embedded ATTACH targets the same in-memory
   registry but does not share state across CLI invocations.

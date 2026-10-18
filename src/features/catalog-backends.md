@@ -69,7 +69,7 @@ use for query workloads.
 ```bash
 docker compose -f docker-compose.unity.yml up -d
 set -a; source .env; set +a
-cargo test -p sqe-catalog --test backends_integration -- --ignored unity_catalog::
+cargo test -p sqe-catalog --test it -- --ignored backends_integration::unity_catalog::
 ```
 
 See the quickstart: [Unity Catalog OSS (Iceberg REST, read-only)](../quickstart/unity-oss.md).
@@ -83,7 +83,7 @@ Thrift metastore protocol. Requires the `hms` cargo feature.
 ```bash
 docker compose -f docker-compose.hms.yml up -d
 set -a; source .env; set +a
-cargo test -p sqe-catalog --features hms --test backends_integration -- --ignored hms::
+cargo test -p sqe-catalog --features hms --test it -- --ignored backends_integration::hms::
 ```
 
 Covered by the suite (`hms::live_hms_namespace_round_trip`, a create / list /
@@ -98,10 +98,35 @@ Git-like Iceberg REST catalog with branch/tag semantics.
 ```bash
 docker compose -f docker-compose.nessie.yml up -d
 set -a; source .env; set +a
-cargo test -p sqe-catalog --test backends_integration -- --ignored nessie::
+cargo test -p sqe-catalog --test it -- --ignored backends_integration::nessie::
 ```
 
 See the quickstart: [Project Nessie (Iceberg REST catalog)](../quickstart/nessie.md).
+
+---
+
+## RustFS S3 Tables
+
+The Iceberg REST catalog built into RustFS 1.0.0-rc.6, served at `/iceberg`
+on the S3 port. The table bucket is the warehouse. RustFS authenticates the
+catalog like an S3 call (SigV4, service name `s3`, payload hash header) but
+does not advertise it in `/v1/config`, so the catalog needs a client-side
+signing block:
+
+```toml
+[catalogs.rustfs]
+catalog_url = "http://rustfs:9000/iceberg"
+warehouse = "warehouse"
+require_vended_credentials = false
+
+[catalogs.rustfs.auth]
+type = "aws"
+signing_name = "s3"
+signing_region = "us-east-1"
+```
+
+The `[storage]` access keys sign the catalog and read and write the data
+files. See the quickstart: [RustFS S3 Tables](../quickstart/rustfs-s3tables.md).
 
 ---
 

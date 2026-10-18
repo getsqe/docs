@@ -21,7 +21,7 @@ For the full security, performance, quality, and observability audit, see `docs/
 ### Topology
 
 - One `sqe-coordinator` or `sqe-server` (all-in-one). No workers.
-- Slim Docker image (`Dockerfile`) with REST catalog + SigV4 (`rest` + `rest-sigv4`). Use `Dockerfile.full` only when runtime config must dispatch to Glue, HMS, or other SDK backends.
+- Slim Docker image (`docker build .`) with the catalog crate's default feature set plus the Glue Hive root, which `sqe-server` always compiles in. The remaining backends (HMS, JDBC, Hadoop): `docker build --build-arg CATALOG_FEATURES=sqe-catalog/full-backends -t sqe-full .`.
 
 ### Security (required even at small scale)
 
@@ -42,17 +42,39 @@ allow_http = false
 allowed_object_store_prefixes = ["s3://your-warehouse/"]
 ```
 
+Keep the global list to what every user may read. A bucket that belongs to
+one workspace goes in that catalog's `tvf_prefixes` instead, so only sessions
+scoped to that catalog can read it with the engine's credentials (see
+[read_parquet](../features/read-parquet.md#which-paths-the-engines-credentials-may-read)).
+When the workspaces share one layout, a single entry with the `{catalog}`
+placeholder (`"s3://staging/ingest/ws/{catalog}/"`) does the same: it expands
+only to the session's catalog, and only when that catalog answered the
+caller's own bearer. If you rely on any of these prefixes to keep workspaces
+apart, set `allow_inline_credentials = false` too. Otherwise a caller who
+passes their own keys bypasses them.
+
 ### Memory
 
 ```toml
 [coordinator]
 memory_pool = "greedy"        # default; do not switch to fair on the coordinator
+unspillable_headroom_percent = 20   # default; share spillable operators may not take
 memory_limit = "12GB"         # tune to ~40-50% of box RAM (example for a 32 GB host)
 spill_to_disk = true
 spill_dir = "/fast-nvme/sqe-spill"
 ```
 
-Greedy pool lets one large operator use the full budget until spill. Fair pool divides memory across every registered spillable consumer. Wide plans (TPC-DS class) register dozens of consumers and fail before spilling when fair is enabled. Workers use fair pool internally; that asymmetry is intentional.
+Greedy pool lets one large operator use the budget until spill. Fair pool divides memory across every registered spillable consumer. Wide plans (TPC-DS class) register dozens of consumers and fail before spilling when fair is enabled. Workers use fair pool internally; that asymmetry is intentional.
+
+`unspillable_headroom_percent` keeps the top share of the pool, and of each query's `query.max_query_memory`, for consumers that cannot spill: the scan's decode buffers, a sort's merge, hash-join builds. Spillable operators (hash aggregates, sorts, repartition buffers) are refused at that line and spill there. Without it a large aggregate fills the cap and the scan feeding it is refused first, failing a query that could have spilled; with the 20% default the same SF10 aggregate under a 2 GB cap completes. The cost is that a lone spillable operator spills a little earlier at a tight cap. `0` turns it off; valid values are 0 to 50. It applies to the greedy pool only.
+
+Within one query, sorts do not take the spillable bytes greedily. A sort runs one sorter per partition; each sorter may grow to an equal share of the spillable bytes before it spills, and the sorters' merge reservations share a quarter of the query's cap (at most `sort_spill_reservation_bytes`, at least 1 MB each). Without this, at 16 partitions the default 10 MB merge reservations alone take 160 MB, and the first sorters to fill leave nothing for the rest. Other operators, such as hash aggregates, still grow to the spillable line.
+
+When concurrent queries fill the node pool, a scan whose own query still has room under `query.max_query_memory` waits for the others to release memory instead of failing. `[catalog] scan_memory_wait_ms` (default 30000) is the most one scan partition waits in total. `0` restores the immediate failure. A scan refused by its own query's cap does not wait, so a join query can be retried with sort-merge joins straight away. Without `query.max_query_memory` there is no per-query cap to compare against, and scans fail at once as before.
+
+A read query that the node pool refuses before its first batch, with room left under its own cap, runs again once there is room (`query.memory_rerun`, default on). This covers what the scan wait cannot: a sort taking its merge reservation back after a spill, an aggregate, a hash-join build. The query drops its attempt, waits until the pool has room for a full `query.max_query_memory` (at most half the pool), and runs the same plan again on the coordinator. One rerun waits or starts at a time per coordinator, so two queries refused together do not collide again. The wait ends at `query.timeout_secs`. A rerun refused again is retried with sort-merge joins when it has a hash join, and fails otherwise. The cost is the abandoned attempt's time: on an SF10 probe with six heavy queries on a 4 GB pool, all six complete, against four before, and the reran sorts finish in 40 to 60 s against 13 s alone.
+
+Memory caps do not bound CPU. Every join runs on the coordinator, and a cross join, or a join with no equal-key condition (`ON a.x < b.y`), compares every pair of input rows while holding little memory. `query.max_cartesian_rows` (default 10,000,000,000) refuses such a read before it runs when the product of its two inputs' row counts exceeds the cap. The counts come from table statistics, exact for a whole Iceberg table and estimated below a filter. A scalar subquery crossed with a fact table passes. A cross join of two 100,000-row tables does not. The error names the cap, not the estimates. An input without statistics is admitted. `0` turns the gate off. The cap applies to the same plans as the sort gate: reads and `EXPLAIN`, not the write path. Equi-joins with skewed keys and large aggregations are not gated; `query.timeout_secs` and the memory caps above are what bound them.
 
 ### Observability
 
@@ -61,7 +83,7 @@ Enable durable audit and lineage early if governance matters. Do not write audit
 ```toml
 [metrics]
 prometheus_port = 9090
-otlp_endpoint = "http://otel-collector:4317"
+otlp_endpoint = "https://otel-collector:4317"   # https: audit events carry user identities and SQL
 trace_sample_rate = 0.10      # 10% at low QPS; lower to 0.01-0.05 at high QPS
 
 audit_log_path = "/var/log/sqe/audit/audit.jsonl"   # must survive pod restart (PVC)
@@ -84,7 +106,7 @@ See [`docs/site/book/src/operations/openlineage.md`](./openlineage.md) for sink 
 
 - Polaris or Nessie over Iceberg REST.
 - SigV4 in the default build covers AWS Iceberg REST (Glue/S3 Tables federated endpoints) without the full Glue SDK image.
-- Defer `full-backends` until runtime config actually dispatches to Glue, HMS, or JDBC SQL catalogs.
+- Defer `full-backends` until runtime config actually dispatches to HMS or JDBC SQL catalogs. Glue Hive roots need no extra feature.
 
 ---
 
@@ -125,6 +147,16 @@ Coordinator: **greedy** pool. Workers: **fair** pool (hardcoded in `sqe-worker`)
 
 Set `SQE_MEMORY_LIMIT` in Kubernetes so the process cap matches the pod limit. A documented 64 GB default on a 31 GB node caused kernel OOM in benchmark runs.
 
+#### Worker scan budget
+
+A worker splits `worker.memory_limit` into sub-budgets under `[worker.memory]`. The one that decides how many concurrent scans a worker can hold in RAM is `scan_budget`, a fifth of the limit by default. It is one budget per worker, shared by every scan the coordinator sends, so a worker with forty inbound scans admits decoded batches from all forty against the same capacity and parks the rest until the coordinator drains. A quarter of it is the fetch lane that charges each open parquet file while it streams; the rest admits decoded batches. When the coordinator's `sqe_worker_reported_scan_budget_free_bytes` sits at zero while the coordinator is busy elsewhere, the worker is waiting on the coordinator, not the other way round. Raise `scan_budget` only together with `memory_limit`: the sub-budgets must fit inside it.
+
+```toml
+[worker.memory]
+scan_budget = "6GB"     # default: memory_limit / 5
+flight_budget = "3GB"   # encoded frames awaiting shipment, default: memory_limit / 10
+```
+
 ### Branches to merge before heavy SF10 load
 
 These are reliability fixes, not optional optimizations:
@@ -150,7 +182,7 @@ These are reliability fixes, not optional optimizations:
 ### Security hardening
 
 - Per-user OIDC. No shared service token for all users.
-- Ranger or OPA policy backend (`policy.engine` not `passthrough`).
+- Ranger policy backend (`policy.engine = "ranger"`, not `passthrough`).
 - `mask_key` configured for hash column masks.
 - Inline-credential TVFs disabled or restricted to admin roles.
 - Restrict catalog/execution error detail for untrusted clients if needed.
@@ -168,9 +200,34 @@ These are reliability fixes, not optional optimizations:
 
 1. Honest `memory_limit` + `spill_to_disk` on NVMe
 2. Add workers (2, then 4, then N)
-3. Enable `parallel_probe_scan` only after memory clamp is validated (TPC-DS regresses without clamp)
+3. `parallel_probe_scan` and `parallel_scan` are already ON by default. Turn `parallel_probe_scan` OFF for workloads of small window and rollup queries (measured at SF1: TPC-DS q67 +45%, q30 +79%, against a +4.0% suite total inside noise). IcebergScanExec still advertises one output partition at the table provider; the parallelism comes from a post-planning rule instead, and flipping that wiring still needs a TPC-DS rerun (issue #414).
 4. jemalloc A/B for glibc RSS parking after large sorts
 5. Do **not** move coordinator to `memory_pool = "fair"`
+
+Coordinator-to-worker HTTP/2 windows are tuned by default as of 2026-08-18 and
+worth checking if you pinned an older config. Before that fix, the coordinator's
+worker channels ran on h2's 65,535-byte stream and connection windows, which cap
+one stream at `window / RTT` no matter how much bandwidth the link has: about
+64 MB/s across a 1 ms hop, 6 MB/s across 10 ms. The connection window is shared,
+so every scan fragment multiplexed to the same worker drew from the same 64 KB.
+The defaults are now 8 MB per stream and 16 MB per connection, matching what the
+coordinator's own Flight SQL server already used. Loopback rigs never showed the
+old ceiling; a separate-host deployment does.
+
+```toml
+[coordinator.transport]
+initial_stream_window_size = 8388608       # 8 MB
+initial_connection_window_size = 16777216  # 16 MB
+max_decoding_message_bytes = 16777216      # 16 MB, both ends of the worker link
+```
+
+`max_decoding_message_bytes` replaces tonic's 4 MiB receive default on the
+worker's Flight server and on the coordinator's clients. Workers read it from
+the same `[coordinator.transport]` section, so one value covers both ends. A
+scan ticket that would still exceed it sheds its pushed runtime-filter
+predicate and ships the fragment unfiltered rather than failing; watch the
+`ticket_predicate_dropped_oversize` metric if scans get slower after raising
+`runtime_filter_inlist_max_values`.
 
 ---
 
@@ -195,7 +252,7 @@ enabled = true
 
 [metrics]
 prometheus_port = 9090
-otlp_endpoint = "http://otel-collector.observability:4317"
+otlp_endpoint = "https://otel-collector.observability:4317"
 trace_sample_rate = 0.05
 
 audit_log_path = "/var/log/sqe/audit/audit.jsonl"
@@ -257,6 +314,37 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 
 ---
 
+## What production mode enforces
+
+`coordinator.production_mode = true` (or `SQE_PRODUCTION_MODE=1`) turns the following into startup errors. The table is the one in `sqe-core/src/config/production.rs`; a unit test fails when the two drift. Each `security.allow_*` waiver is an explicit acknowledgement, logged at startup.
+
+| Rule | What it refuses |
+|---|---|
+| `no-dev-auth-providers` | `auth.providers` containing `anonymous` or `bearer_passthrough` (dev-only; accept any connection or skip local JWT validation). |
+| `rate-limit-enabled` | `rate_limit.enabled = false` (allows query and auth flooding). |
+| `no-insecure-transport` | `security.allow_insecure_transport = true` (cleartext distributed hops expose bearer tokens, worker secrets and vended S3 credentials). |
+| `no-plaintext-client-listeners` | An enabled plaintext Trino HTTP (`trino_http_port`), Quack (without `[coordinator.tls]`) or MCP (without TLS, or on the web port) listener on a non-loopback address, unless `security.allow_plaintext_behind_tls_proxy = true` acknowledges a TLS-terminating proxy in front (client passwords and bearer tokens would cross it in cleartext). |
+| `no-shared-service-identity` | Config-held `client_credentials` in `[auth].providers` or `[catalog(s).auth]` without `security.allow_shared_service_identity = true` (one identity for every user at Polaris/S3). |
+| `worker-secret-required` | `coordinator.worker_urls` set with an empty `coordinator.worker_secret` and `allow_unauthenticated_workers = true` (any TCP-reachable client may register as a worker). |
+| `no-unauthenticated-worker` | `worker.allow_unauthenticated = true` (a worker without a secret accepts scan tickets and credential refreshes from any TCP-reachable client). |
+| `max-sql-bytes` | `query.max_sql_bytes = 0` (disables the pre-parse statement size cap). |
+| `explicit-distributed-credentials` | `coordinator.distributed_credentials = auto` with workers configured (ships the shared `[storage]` keys to workers for tables without vended credentials). |
+| `vended-credentials-required` | A REST catalog without `require_vended_credentials = true` (FileIO would fall back to the shared `[storage]` S3 keys). |
+| `policy-engine-configured` | `policy.engine = passthrough` or `in_memory` (an empty, non-persistent test store) without `security.allow_no_policy_engine = true` (no row filters, masks or column restrictions). |
+| `grant-backend-configured` | `access_control.backend = none` without `security.allow_no_grant_backend = true` (GRANT and REVOKE would be rejected). |
+| `ranger-mask-key` | `policy.engine = ranger` with an empty `policy.mask_key` and no `security.allow_unkeyed_hash_masks = true` (MASK_HASH would fall back to unsalted SHA-256). |
+| `ranger-project-tags` | `policy.engine = ranger` with `policy.ranger.project-tags = false` and no `security.allow_unprojected_tags = true` (Spark would return columns SQE masks). |
+| `no-hmac-tickets` | `worker.accept_hmac_tickets = true` (the HMAC key is the shared worker secret, so it proves nothing about who authored a scan ticket). |
+| `verified-worker-advertise` | `coordinator.allow_unverified_advertise = true` (a secret holder could register an attacker URL and receive every user's scan tickets). |
+| `no-inline-tvf-credentials` | `storage.tvf.allow_inline_credentials = true` (the default; caller-supplied object-store keys would bypass `allowed_object_store_prefixes`). |
+| `mcp-https-resource-uri` | An `http://` `mcp.resource_uri` while MCP is enabled. |
+| `mcp-https-authorization-servers` | An `http://` issuer in `mcp.authorization_servers` while MCP is enabled. |
+| `https-telemetry-endpoints` | An `http://` OTLP, audit-export or (enabled) OpenLineage endpoint on anything but loopback. Audit events and lineage carry user identities and SQL text; a sidecar collector on `localhost` may stay plain. |
+| `ranger-grant-backend-url` | `access_control.backend = ranger` with an empty `access_control.url` (the grant backend would silently be absent and GRANT / REVOKE NotImplemented). |
+| `mcp-no-anonymous-auth` | `mcp.auth.mode = anonymous` while MCP is enabled. |
+
+---
+
 ## Checklist summary
 
 ### Before first production traffic
@@ -280,7 +368,7 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 ### Before multi-tenant
 
 - [ ] Per-user identity end to end
-- [ ] Policy backend (Ranger/OPA) with `mask_key`
+- [ ] Policy backend (Ranger) with `mask_key`
 - [ ] DML policy fields in audit (when implemented)
 - [ ] Inline TVF credentials restricted
 
@@ -303,4 +391,3 @@ Route audit logs and traces through an OpenTelemetry Collector when possible. Au
 - Production config validator, DML audit, observability wiring, and CI for write/distributed have seen substantial progress via prior and current MRs.
 
 Refer to the full audit for the prioritized plan. Keep `sqe.toml.example` and this guide in sync as more items land.
-

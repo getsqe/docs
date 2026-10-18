@@ -1,6 +1,6 @@
 # Roadmap
 
-SQE is developed in phases, each building on the previous. Last swept: 2026-07-05.
+SQE is developed in phases, each building on the previous. Last swept: 2026-10-18.
 
 ## Phase Overview
 
@@ -30,6 +30,7 @@ gantt
     Phase 10 - Benchmarks vs Trino :done, p10, 2026-06, 2026-07
     Phase 8a - Trino Wire Compat :done, p8a, 2026-06, 2026-07
     Write-Path Memory Safety     :done, wms, 2026-07, 2026-07
+    MCP Endpoint (OAuth)         :done, mcp, 2026-08, 2026-08
 
     section Next
     SF100 Scaling                :sf100, 2026-07, 2026-09
@@ -83,7 +84,7 @@ Native dbt support via `dbt-sqe` adapter over ADBC Flight SQL.
 
 ## Phase 3 - Row-Level Writes (Done)
 
-DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/` (DataFusion 54 rebase of `risingwavelabs/iceberg-rust`), which provides `rewrite_files()` transaction support.
+DELETE FROM, UPDATE, and MERGE INTO are implemented via Copy-on-Write using the iceberg-rust fork vendored at `vendor/iceberg-rust/` (apache `main` with the `risingwavelabs/iceberg-rust` row-level write stack merged on top), which provides `rewrite_files()` transaction support.
 
 ### Strategy: Copy-on-Write
 
@@ -127,7 +128,7 @@ Uses the iceberg-rust fork vendored at `vendor/iceberg-rust/` for `rewrite_files
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | Vendored iceberg-rust fork (DataFusion 54 rebase) at `vendor/iceberg-rust/` |
+| `Cargo.toml` | Vendored iceberg-rust fork at `vendor/iceberg-rust/` |
 | `crates/sqe-coordinator/src/delete_handler.rs` | DELETE FROM execution via CoW |
 | `crates/sqe-coordinator/src/update_handler.rs` | UPDATE execution via CoW |
 | `crates/sqe-coordinator/src/merge_handler.rs` | MERGE INTO execution via CoW |
@@ -247,13 +248,13 @@ Not yet wired:
 
 - OPA (Rego) and Cedar were removed: `opa` had a policy store nothing constructed, `cedar` had no implementation, and both only ever failed at startup. Apache Ranger is the policy engine
 - Iceberg-to-Ranger tag sync (so Spark sees SQE-authored column tags) and `SHOW TAGS` read-back
-- See the "Known gaps" in [GRANT and REVOKE](../sql-reference/grant-revoke.md) for SQL-surface limits (no `WITH GRANT OPTION`, table-level INSERT only, scalar-only masks)
+- See the "Known gaps" in [GRANT and REVOKE](../sql-reference/grant-revoke.md) for SQL-surface limits (admin-only `WITH GRANT OPTION`, table-level INSERT only, scalar-only masks)
 
 ---
 
 ## Phase 7 - Iceberg V3 (Done)
 
-Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/iceberg-rust/` is rebased onto DataFusion 54 and carries V3 spec coverage. SQE Iceberg matrix score: 167/189 = 88.4% (per `docs/internal/design-archive/iceberg-matrix.md`).
+Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 147/162 (90.7%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
 
 ### V3 Features Shipped
 
@@ -262,18 +263,24 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 | Default values (`ALTER TABLE ADD COLUMN ... DEFAULT`) | Done |
 | Schema evolution (`ALTER TABLE ADD/DROP COLUMN`, incl. nested struct fields) | Done |
 | Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
+| `VARIANT` columns (unshredded writes, shredded reads; JSON text in and out) | Done |
+| `JSON` stored as variant on V3 tables; `json*` functions read variants | Done |
+| Compaction trigger on the deleted-row share (`delete_ratio_threshold`), which counts deletion vectors | Done |
 | Partition evolution | Done |
 | Equality deletes + position deletes (MoR) | Done |
+| Deletion vectors (MoR DELETE on V3 writes one vector per data file) | Done |
+| Row lineage | Done |
+| Unknown/VOID columns (top-level) | Done |
 
-### V3 Features Still Blocked Upstream
+### V3 Features Not Yet Supported
 
-| Feature | Blocker |
+| Feature | Status |
 |---|---|
-| Variant type | iceberg-rust [#2188](https://github.com/apache/iceberg-rust/pull/2188) not merged |
-| Geometry type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
-| Vector / Embedding type | Iceberg V3 vector spec not finalised |
-| Multi-arg partition transforms | Iceberg Java spec alignment in progress |
-| Row lineage | Deferred upstream |
+| Variant path functions (`variant_get`) | SQE work, tracked in #849 |
+| Shredded variant writes | SQE writes unshredded; shredded files read |
+| Nested unknown fields | Refused on write, not readable |
+| Geometry / geography type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
+| Multi-arg partition transforms | Not started |
 
 ### Other Hardening
 
@@ -282,6 +289,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 - Error messages tuned for catalog and auth failures
 - Partition pruning across all predicate types
 - Iceberg parity harness (`test/iceberg-parity-harness`): DDL/DML/metadata/interop scenarios diffed against Trino on a shared catalog
+- Security audit 2026-09-20 (#708): 33 of 38 source-first findings fixed in ten themed merge requests (2026-09-20/21). Trino OAuth2 pending sessions keyed by the client id; `aud` required when configured; SHOW GRANTS and SET TAGS gated; DML subqueries and appends under the policy enforcer; Hive metadata keyed like SELECT; worker tickets and compaction requests audience-bound; MCP fails closed on unknown table functions and the `system` catalog; redaction handles doubled quotes and ATTACH keys; production_mode refuses inline TVF credentials, HMAC tickets and unverified advertise. Open with documented seams: #716 (Hive information_schema per user), #676, #729 (Hive append), #750
 
 ---
 
@@ -290,7 +298,7 @@ Iceberg V3 table format support landed end-to-end. The vendored fork at `vendor/
 `sqe-cli --embedded` turned out to be a DuckDB-class single-process engine with the same SQL surface as the distributed coordinator. The story is in the blog post `docs/site/blog/2026-05-07-accidentally-duckdb.md`.
 
 - Persistent SQLite-backed Iceberg warehouse at `~/.sqe/warehouse/`, surviving restarts
-- File-format table functions: `read_parquet`, `read_csv`, `read_json`, `read_avro`, `read_delta`, plus bare `'file.parquet'` paths
+- File-format table functions: `read_parquet`, `read_csv`, `read_json`, plus bare `'file.parquet'` paths (`read_delta` was removed with the move to DataFusion 54)
 - Remote sources: `s3://`, `https://`, HuggingFace `hf://` datasets
 - Cross-catalog joins across multiple `--catalog NAME=PATH` mounts
 - Runtime `ATTACH` / `CREATE SECRET` against any of the supported catalog backends
@@ -315,7 +323,26 @@ Deferrals (documented): mTLS, per-event user-OIDC bearer forwarding, MERGE per-b
 
 ## Web UI (Done)
 
-A read-only ops dashboard ships in the coordinator binary, on the health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, live engine metrics with 12h history, and the audit operator log. No login (network-gated), no build step, no external assets. Toggle with `[metrics] web_ui`. Reference: [Web UI](../operations/web-ui.md).
+A read-only ops dashboard ships in the coordinator binary, on the health port (`metrics_port + 1`). Queries with per-fragment timing, cluster nodes, live engine metrics with 12h history, and the audit operator log. Admin bearer required (`require_admin_bearer`), no build step, no external assets. Off by default; toggle with `[metrics] web_ui`. Reference: [Web UI](../operations/web-ui.md).
+
+---
+
+## MCP Endpoint (Done)
+
+An MCP Streamable HTTP endpoint (protocol revision 2025-11-25) served from the coordinator binary, off by default behind `[mcp]`. It is an OAuth resource server: it validates the caller's bearer with the existing auth chain, reuses the same per-user `Session` as Flight SQL and Trino HTTP, and forwards that bearer to the source. No MCP service account.
+
+- `sqe-mcp` crate: Streamable HTTP transport, RFC 9728 protected-resource metadata, bearer challenges, tool dispatch, response bounding
+- `McpConfig` in `sqe-core` with startup validation; mounts on the existing web listener or a dedicated port
+- Eleven read tools behind `read_scope` (incl. `search_tables`, a server-side LIKE over `SHOW SCHEMAS` + `SHOW TABLES`, and `sample_rows`, `SELECT * LIMIT n` as the caller, capped at 100); `execute_sql_readonly` gated by SQE's SQL parser and statement classifier as an allow-list (one statement; query and `SHOW` kinds only, everything else refused by default)
+- `execute_sql_change` hidden unless `allow_writes = true`, then gated on the write scope, an SQE role in `write_roles`, and source authorization
+- Runnable end-to-end stack with Codex and Claude Code templates: `quickstart/mcp/` (14/14 checks, 2026-08-28)
+- `[mcp.auth] mode`: `oauth` (default), `static` principals with env/base64 bearer tokens, `anonymous` for a no-IdP deployment; anonymous refused when an IdP is configured, under `production_mode`, or with writes on
+- Documented at [Model Context Protocol](../deployment/mcp.md) and [MCP with Codex and Claude](../quickstart/mcp.md)
+- Audit attribution: every tool call carries `mcp:<tool>:<client>/<version>` as the session's client label (OCSF `actor.app_name`, the `source` column of `system.runtime.queries`), from the `clientInfo` sent on `initialize` and echoed through an advisory `Mcp-Session-Id`; the auth rate limit is keyed per `(peer IP, bearer fingerprint)` like the Trino path
+- Catalog scoping: `write_catalogs` allowlist on the change tool resolved from the statement's parser-visible target (fail closed on unresolvable targets and target-less kinds); `[[hive.roots]]` need the explicit entry because Hive writes run on engine credentials; `default_catalog` / `default_schema` per endpoint and per static principal; classification through `SqlFrontDoor` with `WireDialect::Mcp`
+- Access-control end-to-end over `/mcp` (`tests/it/mcp_access_control_e2e.rs`, runs under `scripts/access-control-test.sh`): denied-but-valid reads, `list_tables` parity with `SHOW TABLES`, Ranger masks and row filters through `execute_sql_readonly` and `sample_rows`, the change tool's role, catalog and source gates against a live Polaris grant, `search_tables` literal safety
+
+Open: no dynamic client registration on SQE's side (the authorization server owns registration), no MCP resources or prompts (tools only), no streamed partial results, and no mode-2 arm in the quickstart (that stack is Keycloak-based).
 
 ---
 
@@ -328,16 +355,28 @@ The Phase 10 plan called for systematic benchmarking against Trino. That work ha
 - **`sqe-bench` harness**: seven suites (TPC-H, TPC-DS, SSB, TPC-C, TPC-E, TPC-BB, ClickBench), 222 queries, JSON reports committed to `benchmarks/results/` with per-suite history plots at `docs/evidence/benchmark/`
 - **Differential validation**: `sqe-bench compare` runs every query against both engines on the same Iceberg tables and diffs the rows; vacuous results (0/0 agreement) are classified, not counted as passes
 - **Generator fidelity oracle**: generated data validated against DuckDB's official `dbgen`/`dsdgen` output; the oracle caught a TPC-C generator bug and a set of TPC-DS vocabulary gaps (see `docs/site/blog/2026-06-12-the-benchmark-that-lied.md`)
-- **SF1 verdict**: SQE wins six of seven suites vs Trino 465 (README receipts)
-- **SF10 clean-rig verdict**: dedicated host, cache off, DataFusion 54: TPC-H 1.2x, TPC-DS 1.9x, SSB still trailing at 0.5x (scan-bound star joins)
+- **SF1 verdict** (2026-07-09, vs Trino 481): SQE is faster on seven of eight suites; TPC-C's sub-second OLTP reads are the exception
+- **SF10 verdict** (2026-07-09, vs Trino 481): faster on six of seven suites, SSB at parity; TPC-H 1.7x, TPC-DS 1.5x; the bank suite is the exception
 - **Forced-distribution rig**: single worker, threshold zero, every fact scan over Flight; exposed and fixed the dynamic-filter pushdown gap to workers
 - **Attached golden tables for the read suites**: `scripts/benchmark-publish-iceberg.sh` publishes tpch/ssb/tpcds/tpcbb/clickbench/bank into a persistent Polaris once; `BENCH_DATA_SOURCE=attach` then runs tpch/ssb/tpcds/clickbench against the attached `golden` catalog with zero per-run load. Write suites (tpcc/tpce) still generate and load normally, as do bank (published to golden, but attach mode does not yet query it from there) and tpcbb (its own tables are not published, since it shares tpcds's namespace). Bank/tpcbb via attach, and a shallow-clone path that lets tpcc/tpce share golden data files while writing locally, are the deferred follow-up. See [Benchmark Suite](../features/benchmarks.md#fast-benchmark-runs-via-attached-golden-tables).
+
+- **Puffin NDV statistics consumer (experimental, off)**: tables with `write.puffin.stats = 'true'` get a theta-sketch sidecar per column on every CTAS and INSERT commit, including the streaming write paths. With `query.puffin_statistics = true` the planner requests distinct counts through DataFusion 55's `StatisticsRequest`, the Iceberg provider answers them from the snapshot's statistics metadata without opening the sidecar, and the statistics registry feeds them to join selection. Default-on waits on the SF1 plan and runtime A/B (`BENCH_PUFFIN_STATS=1`).
 
 Perf fixes the benchmarks drove: runtime (dynamic) filter pushdown into iceberg-rust scans with two-tier row-group/page pruning, the dynamic-filter snapshot cache (q12 161s to 2.7s), intra-file scan parallelism (`task_split_target_size`), parallel parquet decode per byte-range subtask, and the greedy memory pool.
 
 ### SF100 (Next)
 
-SF100 inverts the SF10 playbook: broadcast joins, in-memory hash tables, and single scan streams each become the bottleneck. Needs memory-pool discipline under concurrency, a true multi-node rig (separate worker hosts), and a streaming data generator. Predicted failure modes: `docs/evidence/perf/sf100-scaling-risks.md`.
+SF100 inverts the SF10 playbook: broadcast joins, in-memory hash tables, and single scan streams each become the bottleneck. Needs memory-pool discipline under concurrency, a true multi-node rig (separate worker hosts), and a data path that scales. Predicted failure modes: `docs/evidence/perf/sf100-scaling-risks.md`.
+
+Data path status:
+
+- [x] Streaming generation for SSB, TPC-DS and TPC-BB: peak memory follows `--threads`, not table size (SSB 84 MB at SF1, 110 MB at SF10).
+- [x] One table-layout definition (partitioning, sort-on-write, blooms) shared by `load` and the direct Iceberg sink; the sink refuses a table it would lay out differently.
+- [x] Direct Iceberg sink writes TPC-H and TPC-C partitioned like `load`, through a bounded per-table buffer (TPC-H SF10 in 39 s at 3.5 GB peak, no staged Parquet).
+- [ ] Date-ordered fact generation for SSB, TPC-DS and TPC-BB, so the direct sink clusters them without a sort; needs a fresh SF1/SF10 baseline.
+- [ ] Stream TPC-C and ClickBench generation (they still build each table in memory).
+- [ ] Switch the benchmark script to the direct sink for every suite, removing the staged-Parquet disk peak.
+- [ ] SF100 peak-memory and load run on a dedicated host.
 
 ### Reliability Testing (Planned)
 

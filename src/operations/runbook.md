@@ -109,14 +109,29 @@ first-touch reads error. Already-planned, already-cached queries may still run
 until the metadata cache TTL expires.
 
 **Likely cause.** The Iceberg REST catalog (Polaris) is unreachable, returning
-5xx, or rejecting the bearer token (401/403). SQE wraps catalog calls in a
-circuit breaker; repeated failures trip it open.
+5xx, or rejecting the bearer token (401/403). SQE wraps catalog calls in one
+circuit breaker per token and catalog. Five consecutive upstream faults open
+it for 30 seconds.
+
+Only upstream faults count: 5xx, timeouts, connection failures and 429. A
+401/403, a 404 or another 4xx is a normal answer from a healthy catalog and
+never opens the breaker, so a client probing for schemas or tables that are
+missing or hidden keeps working. `[catalog] circuit_breaker_failure_classes`
+sets the counted classes (`server_error`, `timeout`, `connection`,
+`rate_limited`, `client_error`, `not_found`, `auth`); the default is the first
+four. An opening breaker logs `Circuit breaker opened` with the token's
+`subject` and the `reason` class of the failure that tripped it.
 
 **Diagnosis.**
 
 ```promql
 # 0 = closed (healthy), 1 = half_open (probing), 2 = open (failing fast).
+# One series per configured catalog (label `circuit` = endpoint); the value is
+# the worst state across that catalog's per-session breakers.
 sqe_catalog_circuit_breaker_state
+# How many per-session breakers are open on each catalog. One or two with a
+# healthy endpoint is a single bad token; all of them is the catalog.
+sqe_catalog_circuit_breakers_open
 # Catalog latency. A spike before the breaker opens is the leading signal.
 histogram_quantile(0.95, rate(sqe_catalog_request_duration_seconds_bucket[5m]))
 ```
@@ -243,6 +258,11 @@ it still OOMKilled, the engine `memory_limit` sits too close to the pod limit.
 - Cap per-query and concurrency budgets in `[query]`: `max_query_memory`,
   `max_concurrent_queries`, `max_result_rows`. Per-user limits live under
   `[rate_limit]`.
+- While the pool is red, new reads run under `pressure_admission_memory`
+  (64MB) and fail with `ResourcesExhausted` naming it when they outgrow it;
+  every other statement except `SHOW`/`DESCRIBE`/`EXPLAIN` is refused,
+  including `SET` and transaction control. Set it to `"0"` to refuse reads
+  at red too.
 
 **Escalation.** Repeated OOMKills after lowering the engine limit, with spill
 active, means a single query is too large for the node. Capture the query from
@@ -297,11 +317,41 @@ ISSUE-220.
 
 ---
 
+## 6. High write conflict rate
+
+**Symptom.** INSERT, UPDATE, DELETE, MERGE statements are slower than expected. Audit log shows repeated retries or `sqe_write_commit_retries_total` is climbing.
+
+**Likely cause.** Concurrent writers on the same table are generating optimistic-concurrency conflicts. Each writer retries automatically with exponential backoff, but sustained high conflicts slow write throughput and can exhaust retry budgets under extreme load.
+
+**Diagnosis.**
+
+```promql
+# Conflicts by operation type (ctas-replace, delete-cow, merge-cow, truncate, etc.).
+sum by (op) (rate(sqe_write_commit_retries_total[5m]))
+# Which users drive the most retries.
+sum by (user) (rate(sqe_write_commit_retries_total[5m]))
+```
+
+```bash
+# Write performance in audit log. grep for "retries", "conflict", "retried" fields.
+tail -100 /var/log/sqe/audit/audit.jsonl | grep -i "insert\|merge\|delete\|update" | jq '.retries'
+```
+
+**Resolution.**
+
+- Expected under dbt incremental models or high-concurrency MERGE workloads: the engine retries transparently and returns success.
+- Sustained high conflict rates point to design: either consolidate writes into fewer, larger statements, or spread writes across non-overlapping partition ranges.
+- If one coordinator is a bottleneck under multi-coordinator HA, ensure session stickiness is wired (sessions are coordinator-local today).
+
+**Escalation.** If write throughput degraded after a code change, capture `sqe_write_commit_retries_total` over time and the failing statement, then page the engine on-call.
+
+---
+
 ## Escalation summary
 
 | Surface | First responder | Page next |
 |---|---|---|
-| Worker crashloop, coordinator OOM, registry flap | SQE on-call | Engine on-call |
+| Worker crashloop, coordinator OOM, registry flap, high write conflicts | SQE on-call | Engine on-call |
 | Catalog (Polaris) outage | SQE on-call | Catalog owner |
 | OIDC provider outage | SQE on-call | Identity team |
 

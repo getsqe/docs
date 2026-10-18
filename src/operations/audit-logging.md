@@ -27,6 +27,9 @@ format                = "native"   # "native" | "ocsf" | "both"
 gdpr_tags             = []         # tag names that mark a column as GDPR-sensitive
 gdpr_identifier_mode  = "tokenize" # "tokenize" | "drop" | "keep"
 superdebug_log_results = false      # NEVER true in production
+max_file_bytes        = 268435456  # rotate at 256 MiB; 0 = never
+max_files             = 0          # rotated files to keep; 0 = keep all
+min_free_bytes        = 1073741824 # below 1 GiB free, delete oldest rotated files; 0 = never
 ```
 
 All keys are optional. The defaults above are the production-safe values.
@@ -89,6 +92,40 @@ environments and disable before going to production.
 Enabling `superdebug_log_results` in production violates SOC 2, ISO 27001, and
 GDPR data-minimisation requirements.
 
+### `max_file_bytes` and `max_files`
+
+`max_file_bytes` defaults to 256 MiB and `max_files` to `0`: files rotate, and
+every rotated file is kept. `max_file_bytes = 0` turns rotation off and the file
+grows without limit. Once the native file or, with `format = "ocsf"`
+or `"both"`, the OCSF file reaches the limit, both move to
+`<audit_log_path>.<generation>` and `audit.ocsf.jsonl.<generation>` (generation
+`00000001`, `00000002`, ...) and the writer opens fresh files.
+
+Rotation does not break the hash chain. The first record of the new file chains to
+the last record of the rotated one, and a restart on a still-empty file resumes
+from the newest rotated file. `--verify-audit <audit_log_path>` checks every
+generation in order (see below).
+
+By default nothing is deleted while the disk has room. Audit history is removed in
+two cases only:
+
+- **The volume is about to fill.** Every 10 seconds the writer checks free space
+  on the audit volume. Below `min_free_bytes` (default 1 GiB) it deletes the
+  oldest rotated generations, one at a time, until the floor is met again. The
+  newest rotated file is never deleted. Each deletion logs an `ERROR` and writes
+  a `maintenance` record (`error_code = "PRUNED"`, the deleted generations in the
+  message) into the chain, so the gap is explained inside the log itself. Set
+  `min_free_bytes = 0` to never delete. A full disk then drops new audit events
+  (`sqe_audit_events_dropped_total{reason="io"}`), and anything else sharing
+  that volume runs out of space too.
+- **`max_files` is set.** The writer keeps that many rotated generations and
+  deletes the oldest, with the same chain record.
+
+Deleting is intended truncation of the history, not tampering: the oldest kept file
+simply does not start at genesis, and the `PRUNED` record says why. If your retention
+policy needs the full trail, ship rotated files off the volume before the floor is
+reached.
+
 ## Auth provider claim paths
 
 The `oidc_password` and `bearer_token` auth providers accept three optional claim-path
@@ -125,6 +162,7 @@ to an OCSF class before writing. The mapping is fixed at the kind level.
 |----------------|-----------|-----------|----------|--------------|
 | `query` | Datastore Activity | 6005 | Application Activity | 6 |
 | `policy_decision` | Datastore Activity | 6005 | Application Activity | 6 |
+| `transaction` | Datastore Activity | 6005 | Application Activity | 6 |
 | `auth` | Authentication | 3002 | Identity & Access Management | 3 |
 | `session` | Authorize Session | 3003 | Identity & Access Management | 3 |
 | `grant` | Account Change | 3001 | Identity & Access Management | 3 |
@@ -145,6 +183,9 @@ Standard OCSF fields used:
 - `actor.user.email_addr`: email claim, when present.
 - `actor.user.groups`: array of group objects `{"name": "..."}`.
 - `actor.user.roles`: roles array.
+- `actor.app_name`: the initiating client, when the protocol reports one:
+  `X-Trino-Source` on Trino HTTP, `mcp:<tool>:<client>` on the MCP endpoint.
+  Absent for Flight SQL and for system events.
 - `resources`: array of `{"name": "catalog.namespace.table", "type": "Table"|"View"}`.
 - `src_endpoint.ip`: client IP, when present.
 - `metadata.product.name`: `"SQE"`.
@@ -183,6 +224,47 @@ Redaction and GDPR masking run before chain stamping so the chain covers the
 post-redaction bytes. Modifying a record to restore redacted content will break the
 chain.
 
+### Verifying a log or an extract
+
+`sqe-server --verify-audit <file>` checks the chain of a native audit file and exits
+without starting a server. Exit code 0 means intact, 1 means broken, with the first bad
+line named. The report carries what a chain-of-custody record needs:
+
+```text
+sha256:          2f1e56dc...   (the file as handed over)
+records:         151 (seq 100..=250)
+first prev_hash: 0414fcbc...   (hash of seq 99 in the source log)
+last hash:       0f2b6079...   (prev_hash of seq 251 in the source log)
+chain:           OK
+```
+
+Pointed at a rotated log's active path, it verifies every `<file>.<generation>`
+oldest first, then the active file, and fails if any file does not chain to the
+one before it. Pass a single rotated file to verify only that file.
+
+Verification needs the native file: `format = "native"` or `"both"`. An `ocsf`-only
+deployment has nothing to recompute the hashes from, so pick `"both"` if you may ever
+need to prove a log is intact.
+
+### Extracting records for an investigation
+
+1. Copy the audit file. Never edit or filter the live file in place.
+2. Cut a contiguous line range from the copy with `sed -n 'FIRST,LASTp'`. Find the line
+   numbers with `grep -n '"seq":100,'`. Do not rewrite lines with `jq` or an editor: a
+   reformatted line no longer matches its hash.
+3. Run `sqe-server --verify-audit` on the source copy and on the extract. Both must say
+   `OK`.
+4. Check the anchors. The extract's `first prev_hash` must equal the `hash` of the record
+   before it in the source, and its `last hash` the `prev_hash` of the record after it.
+   Matching anchors prove nothing was cut from either end.
+5. Record the extract's sha256, sequence range and both anchors, with who made it and
+   when, and hand over the extract and the report together. The receiver reruns
+   `--verify-audit` and compares the sha256.
+
+A `broken segment` line in the report marks a restart after a crash left a torn record.
+The writer starts a fresh segment on purpose, so the log stays verifiable. Keep the
+report line with the extract: it explains the gap.
+
 ## PII redaction (always-on)
 
 Before any record is written, `redact_pii` runs unconditionally on the SQL query text.
@@ -193,7 +275,7 @@ It replaces:
 - Phone numbers with `[PHONE]`
 - Credit-card-like sequences with `[CARD]`
 - Secret-keyword literals (`TOKEN '...'`, `PASSWORD '...'`, `ACCESS_KEY_ID '...'`,
-  `SECRET_ACCESS_KEY '...'`, `SESSION_TOKEN '...'`, `API_KEY '...'`,
+  `KEY_ID '...'`, `SECRET_ACCESS_KEY '...'`, `SESSION_TOKEN '...'`, `API_KEY '...'`,
   `CLIENT_SECRET '...'`, `BEARER '...'`) with `[REDACTED]`
 
 The secret-literal pass guards against `CREATE SECRET ... TOKEN '<jwt>'` landing
@@ -218,16 +300,79 @@ OCSF spool and OCSF file.
 | GRANT / REVOKE | OCSF file + native sink | Canonical `AuditEvent` |
 | Authentication events | OCSF file + native sink | Canonical `AuditEvent` |
 | Session lifecycle events | OCSF file + native sink | Canonical `AuditEvent` |
-| Secret-bearing statements (CREATE SECRET, DROP SECRET, SHOW SECRETS, ATTACH, DETACH) | Native sink only | Legacy flat `AuditEntry` (redacted path; credentials never reach canonical form) |
+| Secret-bearing statements (CREATE SECRET, DROP SECRET, SHOW SECRETS, ATTACH, DETACH) | Native sink + OCSF file + export spool | Legacy flat `AuditEntry` in the native file; the same record as OCSF class 6005 |
+| Result-cache hits (buffered path, `[query_cache] enabled`) | OCSF file + native sink | Same success record as the run that filled the entry |
+| Statements that fail at parse or planning (Flight SQL, Trino HTTP, streaming and buffered) | OCSF file + native sink | Failed `query` record (`status_id` 2); `statement_type` `unknown` when the SQL does not parse |
+| Transaction start and end (SQL `START TRANSACTION`, Trino HTTP) | OCSF file + native sink | `transaction` record; details under `unmapped.transaction` |
 
-Secret-bearing statements stay on the redacted legacy path. Routing them through the
-canonical path would risk writing credential literals to the OCSF file before
-redaction applies. The legacy path runs redaction inline, so bearer tokens and
-catalog credentials embedded in SQL text are stripped before any byte is written.
+A transaction writes two `transaction` records besides the records of its
+statements. The first goes out when the transaction's first statement runs, with
+`action` `begin`. The second goes out when it ends, with `action` `commit` or
+`rollback` and a `reason`: `committed`, `conflict`, `rolled_back`,
+`session_ended`, `idle_timeout`, `lifetime` or `shutdown`. A lost `COMMIT` is
+`action` `commit`, `reason` `conflict`, `status_id` 2 and error code
+`TRANSACTION_CONFLICT`. The end record carries `duration_ms` and, after a
+successful `COMMIT`, `published`: the `main` snapshot id each table now points
+at. `unmapped.transaction.id` is the transaction id the client holds, so the
+two records join to each other and to the statement records in between by
+username and time.
+
+The actor on a `transaction` record is the username alone. The record has no
+session id, groups or client address, because a transaction outlives the
+request that opened it and the coordinator ends some on its own (idle timeout,
+lifetime, shutdown). A transaction that ends without running a statement
+started nothing and writes no `transaction` record.
+
+Secret-bearing statements keep the redacted legacy path. The entry is redacted
+once, before it is queued, so bearer tokens and catalog credentials embedded in the
+SQL are stripped before any byte is written. The OCSF line is built from that
+already-redacted entry, never from the raw SQL, and carries the native record's hash
+as `metadata.uid`. Its text is byte-for-byte the text in `audit.jsonl`, so an
+OCSF-only SIEM sees these statements without seeing anything the native file hides.
 
 The legacy `AuditEntry` format is flat JSON. It carries username, statement type,
 duration, status, and `tables_touched` (unqualified table names), but not structured
-resources, actor email, groups, or policy decision fields.
+resources, actor email, groups, or policy decision fields. The OCSF form of a legacy
+entry has the same gaps: no resources, no query id, no trace id.
+
+A result-cache hit never plans, so its record takes resources and the policy block
+from the run that filled the entry. The policy block still applies: a hit is served
+only under the policy fingerprint it was produced under. The schema has no cache-hit
+field. A hit is a successful `query` record with `timing.execution_ms`,
+`stats.bytes_scanned` and `stats.rows_scanned` all 0.
+
+Hits are rare in this release. The cache is read only on the buffered path, and a
+cache entry belongs to one session. Flight SQL, Trino HTTP and Quack stream their
+SELECTs and never read the cache. MCP runs SELECTs buffered but opens a session per
+call. Every hit is audited all the same.
+
+### Deliberately not audited
+
+Three paths write no audit record. Each is a decision, not an oversight.
+
+**Statements over `query.max_sql_bytes`.** The size cap rejects the text before it
+is parsed, and the client gets `InvalidArguments`. No record is written today. The
+text is attacker-sized and unparsed, so it must never be logged. The decided shape
+for a later release is a failed `query` record carrying `query_hash` only, with no
+text. Until then, an operator who needs these attempts counted should alert on the
+client-facing error rate.
+
+**Admission rejections under overload.** Memory-pressure rejections, and the
+per-user and global concurrency limits (`max_concurrent_per_user`,
+`max_concurrent_queries`), write no audit record by design. They fire exactly when
+the coordinator is saturated. A record per rejection would add audit I/O to an
+overload, and with a fail-closed audit log a full queue would turn that overload into
+an outage for every caller. Memory-pressure rejections log a `WARN` line with the
+user name. The concurrency limits log nothing and have no metric yet; a counter by
+rejection reason is the planned signal, not a per-event record.
+
+**Trino session-control statements answered by the protocol layer.** `PREPARE`,
+`DEALLOCATE PREPARE`, `SET SESSION`, `RESET SESSION` and `SET CATALOG` never reach
+the engine. They change client-held session state in response headers and read or
+change no data, grants or catalog objects. The statements that use that state are
+audited when they run: `EXECUTE` hands its bound text to the executor, and the
+record carries that text. `USE` is not in this list: it goes to the executor and is
+audited like any other statement.
 
 ## Exporting to a SIEM (OTLP)
 
@@ -245,7 +390,7 @@ otlp_endpoint    = ""             # e.g. "http://otel-collector:4317"; empty -> 
 spool_path       = ""             # empty -> <audit_log_path>.ocsf.spool.jsonl
 batch_max        = 512            # maximum records per OTLP export batch
 flush_interval_ms = 2000          # shipper poll interval in milliseconds
-max_spool_bytes  = 1073741824     # 1 GiB; spool size above this emits a WARN
+max_spool_bytes  = 1073741824     # 1 GiB; hard cap, the oldest unshipped records go past it
 start_at         = "now"          # "now" (default) | "beginning"
 ```
 
@@ -266,8 +411,14 @@ any other value logs a warning and the exporter does not start.
 #### `otlp_endpoint`
 
 The OTLP/gRPC endpoint URL for the collector. If empty, the exporter falls back to
-`metrics.otlp_endpoint`. If both are empty the server logs a warning at startup and
-the exporter does not start.
+`metrics.otlp_endpoint`. If both are empty, or the exporter cannot be built, the
+server logs a warning at startup, the exporter does not start and no spool is
+written. Nothing would drain or cap it.
+
+Use an `https://` endpoint whenever the collector is not on the same host. SQE
+verifies the collector certificate against the system trust store; point
+`SSL_CERT_FILE` at your bundle for a private CA. Audit events carry user identities
+and SQL text, so a plain `http://` hop across the network leaks them.
 
 #### `spool_path`
 
@@ -291,10 +442,27 @@ Lower values reduce latency to the SIEM at the cost of more frequent OTLP calls.
 
 #### `max_spool_bytes`
 
-Spool size threshold in bytes. When the spool file exceeds this value the exporter
-emits a `WARN` log. The exporter continues and queries are never blocked. Default:
-1 073 741 824 (1 GiB). Spool rotation and automatic pruning are not implemented in
-this release; size management is left to the operator.
+Hard cap on the spool file in bytes. Default: 1 073 741 824 (1 GiB).
+
+The shipper empties the spool once every record in it has shipped and it has reached
+16 MiB, so a healthy exporter keeps it small. A spool only grows past that while the
+collector is unreachable. When it passes `max_spool_bytes` the shipper first cuts the
+records it has already shipped. If that is not enough, it drops the oldest unshipped
+records until the spool is at half the cap, logs a `WARN` and counts them in
+`sqe_audit_export_spool_dropped_records_total`. An outage therefore cannot fill the
+disk, and queries are never blocked or refused because of it.
+
+The spool is only the delivery buffer for the SIEM. The local audit log
+(`audit_log_path`) and its hash chain keep every record, so dropped records can be
+recovered from it, and the SIEM sees the gap as missing `audit.seq` values. Size the
+cap for the outage you want to ride out: at 1 KB per record, 1 GiB holds about a
+million statements. The `SqeAuditExportStalled` alert is the signal to act before the
+cap is reached.
+
+The cap does not cover the local audit log itself, which SQE only appends to. Rotate
+it with your platform's log rotation and keep its disk monitored. A write that fails
+there (for example on a full disk) is counted in
+`sqe_audit_events_dropped_total{reason="io"}` and does not refuse queries.
 
 #### `start_at`
 
@@ -311,12 +479,13 @@ delivery: a restart resumes exactly where the last successful export acked.
 
 ### Behavior and durability
 
-The exporter provides at-least-once delivery. Records are never removed from the spool.
-The background shipper tails the spool from the byte offset recorded in the cursor file,
+The exporter provides at-least-once delivery for every record that stays in the spool.
+Records leave the spool once shipped, or when an outage pushes it past
+`max_spool_bytes` (see above). The background shipper tails the spool from the byte offset recorded in the cursor file,
 batches up to `batch_max` records, sends them to the collector, and advances the cursor
 only after the collector returns a successful ack.
 
-A collector outage grows the spool. Queries continue without delay. When the collector
+A collector outage grows the spool up to `max_spool_bytes`. Queries continue without delay. When the collector
 recovers, the shipper replays from the last cursor position.
 
 The exporter uses a dedicated OTLP log pipeline. It is not connected to the
@@ -355,6 +524,7 @@ SIEM queries that filter on any of these attributes avoid parsing the full body.
 | `sqe_audit_export_batch_failures_total` | Counter | OTLP export calls that returned an error |
 | `sqe_audit_export_spool_lag_bytes` | Gauge | Bytes between the cursor offset and the current end of spool |
 | `sqe_audit_export_cursor_seq` | Gauge | Last sequence number successfully acked |
+| `sqe_audit_export_spool_dropped_records_total` | Counter | Unshipped records dropped to hold the spool under `max_spool_bytes` |
 | `sqe_audit_export_last_success_timestamp` | Gauge | Unix timestamp of the last successful export |
 
 `sqe_audit_export_spool_lag_bytes = 0` means the shipper is caught up. A rising value
@@ -363,9 +533,6 @@ connectivity problem.
 
 ### Deferred
 
-- **Spool rotation and retention.** Only a bounded-growth `WARN` at `max_spool_bytes`
-  is implemented. Rotation, age-based pruning, and size-capped compaction are not
-  built yet.
 - **Kafka target.** The `target = "kafka"` config key is reserved. It is not
   implemented in this release.
 
@@ -388,7 +555,8 @@ role before it serves any content.
 | `/api/v1/metrics/history` | Bearer + admin role |
 | `/healthz` | Open (no auth) |
 | `/readyz` | Open (no auth) |
-| `/api/v1/status` | Open (no auth) |
+| `/api/v1/status` | Open (no auth); status and role only |
+| `/api/v1/status/detail` | Bearer + admin role |
 
 The three open endpoints serve Kubernetes liveness/readiness probes and load-balancer
 health checks. They must not require credentials.
@@ -451,6 +619,13 @@ is available. The health server is served with `into_make_service_with_connect_i
 so `ConnectInfo<SocketAddr>` is always present for real TCP connections. If
 `[security] trusted_proxies` is configured, the XFF header is honoured with the same
 rightmost-untrusted-hop rule used by the Flight SQL and Quack paths.
+
+`trusted_proxies` takes exact addresses and CIDR ranges, IPv4 and IPv6
+(`["10.42.0.0/16", "fd00::/8"]`). An IPv4 peer reported as IPv4-mapped IPv6
+by a dual-stack listener matches IPv4 entries. A range trusts every address
+in it: any of them can set `X-Forwarded-For` and so choose the client IP that
+lands in the audit record. Keep the range as narrow as the ingress allows.
+An entry that is neither an address nor a range fails config validation.
 
 ### Field consistency
 

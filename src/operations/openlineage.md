@@ -16,6 +16,17 @@ Use these events to drive a lineage UI (Marquez, DataHub) or to feed a metadata 
 
 Each query produces two events: a START at submit time and a COMPLETE on success or FAIL on error.
 
+Inside a transaction, a write's START goes out when the statement runs, and its COMPLETE waits for the transaction to end. `COMMIT` releases every held COMPLETE. A rollback, a conflict, an ended session, a timeout or a shutdown turns each one into a FAIL with the message `transaction not committed (<reason>)`, where the reason is the outcome label (`rolled_back`, `conflict`, `session_ended`, `idle_timeout`, `lifetime`, `shutdown`). A lineage graph therefore never shows a write that `main` never saw. Each event keeps its own inputs and column lineage. `eventTime` on the held COMPLETE is the moment the transaction ended. `BEGIN`, `COMMIT`, `ROLLBACK` and `SET TRANSACTION` emit no runs of their own.
+
+### Dataset names and facets
+
+- Every input and output dataset has namespace `sqe://<catalog>` and name `<schema>.<table>`, where `<catalog>` is the Iceberg catalog the table was read from or written to. A REST catalog is named after its warehouse. An unqualified or two-part table name resolves in the statement's session catalog and schema.
+- Each dataset carries a `symlinks` facet with a `TABLE` identifier: namespace is the catalog URI and name is `<catalog>.<schema>.<table>`. `dataSource` keeps the catalog URI.
+- The output fields of INSERT, MERGE, UPDATE and DELETE are named after the target table's columns, by position.
+- `lifecycleStateChange` is `CREATE` for CREATE TABLE and CTAS, `OVERWRITE` for CREATE OR REPLACE and INSERT OVERWRITE, `TRUNCATE` for TRUNCATE, and `DROP` for DROP TABLE.
+- An INSERT append or CTAS carries the committed Iceberg snapshot id as the `version` facet (`datasetVersion`). Other writes do not carry one yet. Inside a transaction the id is the head of the transaction's branch. `COMMIT` fast-forwards `main` to that head when it publishes a table without replaying the writes.
+- Every event carries the run facet `sqe_query` with `queryId`, equal to `runId`. For a statement over the Trino HTTP protocol, that is the query id the client polls.
+
 ## Configuration
 
 ```toml
@@ -28,7 +39,7 @@ file_path      = "/var/log/sqe/lineage.jsonl"
 http_endpoint  = "https://marquez.example.com/api/v1/lineage"
 
 # HTTP transport
-auth_mode           = "bearer"           # "none" | "bearer" | "user_token"
+auth_mode           = "bearer"           # "none" | "bearer"
 api_key             = "..."              # required when auth_mode = "bearer"
 http_timeout_ms     = 5000
 http_retry_attempts = 1
@@ -88,16 +99,23 @@ spool_path = "/var/spool/sqe-ol"
 
 **No events appear in Marquez or DataHub.** Check `enabled = true` and that at least one sink is configured. Validation is enforced at startup; the server refuses to start with a misconfigured block.
 
-**Spool directory grows.** The collector is unreachable. SQE buffers up to `spool_max_bytes` then drops newest events. Inspect `/var/spool/sqe-ol/spool.jsonl*`. Restore the collector and the replay loop drains within `replay_interval_secs`.
+**Spool directory grows.** The collector is unreachable. SQE buffers up to `spool_max_bytes`. When it is full, the oldest spooled events are deleted to make room. A long outage therefore keeps the most recent lineage, and each dropped event counts in `sqe_lineage_spool_dropped_events_total`. A warning is logged once each time the spool reaches its cap. Inspect `/var/spool/sqe-ol/spool.jsonl*`. Restore the collector and the replay loop drains the spool oldest first within `replay_interval_secs`. Queries are never held up by an outage.
 
 **`sqe_lineage_dropped_events_total` counter increments.** The bounded mpsc channel was full. Increase `channel_capacity` or investigate why the emitter is slow (collector too slow? HTTP timeouts?).
 
 **`sqe_lineage_sink_errors_total{sink="http"}` increments.** Same: collector unreachable. With `spool_path` configured, events still reach disk.
 
+## Policy and completeness in column lineage
+
+Two properties of the `columnLineage` facet matter to a governance tool that propagates tags or plans deletions from it:
+
+- **Masked and restricted source columns are reported as `MASKED`, not identity.** When the caller's policy masks or restricts a column of a scanned table, every target column that derives from it carries the transformation `{type: "DIRECT", subtype: "MASKED", masking: true}` instead of `IDENTITY` or `TRANSFORMATION`. The target holds hashes, `***` or NULL, so the source column's tags must not be propagated onto it and the raw value was not copied. The decision comes from the policy enforcer's own record of what it applied to the plan, not from guessing at expression shapes.
+- **An incomplete trace says so.** The column tracer has rules for scans, projections, filters, aggregates, joins, unions, sorts, limits, distinct, aliases, windows and single-input extensions. A plan node outside that set (`Unnest`, `RecursiveQuery`, `Values`, a multi-input extension, ...) contributes no dependencies, and the affected target columns are then absent from `columnLineage`. Whenever that happens the run carries the custom facet `sqe_lineageQuality: {complete: false, untraced: ["Unnest"]}`, so a consumer can tell "this column has no source" from "the extractor gave up". Complete traces carry no facet.
+
 ## v1 limitations
 
 - No mTLS to the collector. Bearer auth only.
-- `auth_mode = "user_token"` (forwarding the user's OIDC bearer per event) is wired but currently falls back to the static `api_key` in v1; full per-event token forwarding is a follow-up.
+- `auth_mode = "user_token"` is rejected at startup. Lineage events do not carry session credentials. To authenticate to a collector, use `auth_mode = "bearer"` with a dedicated collector `api_key`; migrate any previous `user_token` configuration to this explicit mode.
 - Maintenance procedures (OPTIMIZE, VACUUM, REWRITE_MANIFESTS) are never emitted.
 - MERGE column-level lineage is emitted at the dataset level; per-branch annotations (MERGE_INSERT vs MERGE_UPDATE) are deferred until DataFusion exposes a Merge LogicalPlan node.
 - DDL paths (CREATE TABLE, DROP, etc.) emit events with `plan = None`. The dataset target is captured but column lineage is empty for DDL.

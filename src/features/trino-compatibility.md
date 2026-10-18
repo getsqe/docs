@@ -18,8 +18,8 @@ trino_http_port = 8080    # 0 to disable
 | `/v1/info` | GET | Node info (version, uptime, coordinator status) |
 | `/v1/info/state` | GET | Plain text: `ACTIVE` or `STARTING` |
 | `/v1/statement` | POST | Submit a SQL query |
-| `/v1/statement/queued/{id}/{token}` | GET | Poll a queued/running query until results are ready |
-| `/v1/statement/{id}/{token}` | GET | Fetch paginated results |
+| `/v1/statement/queued/{id}/{slug}/{token}` | GET | Poll a queued/running query until results are ready (finding 702) |
+| `/v1/statement/{id}/{slug}/{token}` | GET | Fetch paginated results (finding 702) |
 | `/v1/statement/{id}` | DELETE | Cancel a running query |
 
 ## Authentication
@@ -74,6 +74,19 @@ Query results are paginated. The initial response includes a `nextUri` field. Fo
 
 When `nextUri` is absent, all results have been consumed.
 
+## Poll Token Security (finding 702)
+
+Every `nextUri` in poll responses carries a session-binding token (`{slug}/{token}` in the URL) that proves the poll is from the same client that submitted the query. Clients must:
+
+1. Follow `nextUri` **verbatim** (SQE clients do this already via the JDBC driver and CLI).
+2. Pass credentials only on the initial `POST /v1/statement`; subsequent polls on `{slug}/{token}` do not require authentication if the token is valid.
+
+The rate limiter runs on every route (including polls), protecting against credential-guessing attacks. A token is 32 random bytes (base64url, non-predictable). Ownership is checked by session ID and subject (`sub` claim), not by display username, so a second authentication provider in the chain cannot hijack another user's session.
+
+The two-segment `GET /v1/statement/{id}` form (without slug/token) is no longer accepted; clients must use the three-segment form with the poll token from the previous response's `nextUri`.
+
+
+
 ## Async Submission
 
 Submission is async, matching Trino's own protocol. `POST /v1/statement` spawns the query on a background task with a bounded initial wait. If the query does not finish in that window, the first response carries `state: QUEUED`, no `data`, and a `nextUri` pointing at `/v1/statement/queued/{id}/{token}`:
@@ -123,10 +136,32 @@ BI tools that speak Trino connect through the same endpoint. Metabase uses the T
 - `DESCRIBE` and `SHOW COLUMNS` resolve double-quoted identifiers (`"catalog"."schema"."table"`), so field discovery works.
 - Types map to their Trino equivalents: `timestamp(6)` carries its precision in the type signature (so date bucketing over JDBC works), and computed unsigned-64 aggregates like `count(*)` map to `bigint` rather than `decimal`.
 
+## Metadata statements
+
+`SHOW SCHEMAS FROM <catalog>` and `SHOW TABLES FROM <catalog>.<schema>` answer
+for the catalog they name, not the session catalog. A trailing
+`LIKE '<pattern>'` filters the names the way Trino does: `%` matches any run,
+`_` one character, and the match is case-sensitive (`ILIKE` is not). dbt-trino
+checks whether a schema exists with exactly this form:
+
+```sql
+SHOW SCHEMAS FROM ws_cbs_energy LIKE 'cbs_silver';
+SHOW TABLES FROM ws_cbs_energy.cbs_silver LIKE 'fact%';
+```
+
+`ESCAPE` is not accepted on `SHOW` statements, so `_` in a pattern always
+matches any single character.
+
+A catalog that does not exist, or that the caller may not see, fails with
+Trino's error: `Catalog 'x' does not exist` (`CATALOG_NOT_FOUND`). The two
+cases read the same, so the reply does not reveal which one applies. A
+catalog the caller can reach but whose schemas it may not list returns an
+empty result.
+
 ## Limitations
 
 - The Trino endpoint returns results as JSON (Trino wire format), not Arrow. For maximum performance, use Flight SQL.
-- Transaction control (`START TRANSACTION`, `COMMIT`) is not supported. Queries execute in auto-commit mode.
+- `START TRANSACTION` (what JDBC sends after `setAutoCommit(false)`) answers with `X-Trino-Started-Transaction-Id`, and a successful `COMMIT` / `ROLLBACK` with `X-Trino-Clear-Transaction-Id`. Unlike Trino's Iceberg connector, DML inside the transaction runs on a private branch and `COMMIT` publishes it (see [Transactions](../sql-reference/dml.md#transactions)). DDL still fails with `AUTOCOMMIT_WRITE_CONFLICT` ("Catalog only supports writes using autocommit"). The id belongs to the coordinator that issued it: another coordinator, or the same one after a restart, answers `TRANSACTION_CONFLICT`. `SNAPSHOT` isolation and savepoints are refused.
 - Type mapping covers common types; complex nested types may differ from native Trino behavior.
 - Iceberg hidden columns (`$path`, `$file_modified_time`, `$partition`) are not exposed on table scans. They need a per-row, per-source-file column that is resolvable by name but excluded from `SELECT *`. DataFusion has no such metadata-column mechanism yet (tracked upstream at apache/datafusion#20135, not in any release), and adding the column to the scan schema would make every `SELECT *` return it. For file-level introspection use the `table_files('ns', 't')` table function, which lists `file_path`, `record_count`, and `file_size_in_bytes` per data file.
 - Materialized views are not supported. `CREATE MATERIALIZED VIEW` returns a clear "not supported" error rather than creating a plain view. `DROP MATERIALIZED VIEW IF EXISTS` is treated as a no-op so client tooling that issues it on teardown can proceed.

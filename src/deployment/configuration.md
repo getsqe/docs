@@ -14,10 +14,13 @@ SQE_CONFIG=/etc/sqe/sqe.toml sqe-server
 
 ## Full Reference
 
+The MCP block has its own page with the authorization model and tool reference: [Model Context Protocol](./mcp.md).
+
 ```toml
 [coordinator]
 flight_sql_port = 50051         # Flight SQL gRPC port
 trino_http_port = 8080          # Trino-compat HTTP port (0 to disable)
+trino_https_port = 0            # Trino-compat over TLS with [coordinator.trino_tls] (0 = off)
 mode = "hybrid"                 # "coordinator", "worker", "hybrid", "local", "distributed"
 worker_urls = []                # Worker Flight URLs for distributed mode
 worker_secret = ""              # Shared secret for worker heartbeat auth (empty disables the check)
@@ -30,11 +33,61 @@ session_context_cache_ttl_secs = 60  # Per-user SessionContext cache TTL. Also t
                                 # this window. POST /api/v1/catalogs/refresh (health
                                 # port, admin) is the instant path. Lower = fresher
                                 # catalogs, more session rebuilds under concurrency.
+ticket_signing_key_file = ""        # Path to Ed25519 PKCS#8 private key for signing scan tickets
+                                # Empty: generate ephemeral key at boot (multi-coordinator needs this set).
+                                # For multi-coordinator HA, set to the same key on all coordinators.
+ticket_ttl_secs = 300           # Seconds scan tickets remain valid; workers refuse expired tickets (finding 601)
+allow_unverified_advertise = false  # Accept worker heartbeats whose advertised URL doesn't match the peer (test-only, behind NAT/proxy)
+distributed_credentials = "auto" # "auto" (default), "vended", "static", "worker_default"; which storage creds scan tickets carry (finding 401)
+
 
 [coordinator.tls]
 cert_file = ""                  # PEM certificate (TLS enabled when both cert + key are set)
+                                # HTTP listeners hot-reload this every 60s; Flight needs a restart
 key_file = ""                   # PEM private key
-ca_file = ""                    # Optional PEM CA for mTLS client certificate verification
+ca_file = ""                    # Optional PEM CA. Server side: requires a client certificate on
+                                # every listener. Client side: trust root for https:// worker and
+                                # coordinator URLs. Required for a private cluster CA.
+allow_ip_advertise = false      # Permit a bare-IP worker.advertise_url under TLS (needs IP SANs)
+
+# [coordinator.trino_tls]       # Certificate for trino_https_port; same fields as above.
+# cert_file = ""                # Hot-reloaded every 60s like the other HTTP listeners.
+# key_file = ""
+# ca_file = ""                  # Optional: require client certificates on the Trino HTTPS port
+
+[mcp]                           # Model Context Protocol endpoint. Off by default.
+enabled = false                 # true mounts /mcp. A nonzero port alone still does, with a deprecation WARN, for one release
+port = 0                        # 0 = share the health/web listener; nonzero = own listener + TLS
+bind_address = ""               # Own listener's interface; empty = 127.0.0.1 under mode = "anonymous", 0.0.0.0 otherwise
+resource_uri = ""               # Public MCP URL; the RFC 8707 resource / token audience
+authorization_servers = []      # Issuers advertised in RFC 9728 metadata
+allowed_origins = []            # Exact browser origins; native clients send no Origin
+read_scope = "sqe:mcp:read"     # Scope required for discovery and all read tools
+write_scope = "sqe:mcp:write"   # Additional scope required by execute_sql_change
+allow_writes = false            # false hides execute_sql_change from tools/list
+write_roles = ["data_writer"]   # SQE roles allowed to call execute_sql_change
+max_result_rows = 1000          # Row cap per tool response
+max_response_bytes = 2097152    # Byte cap per tool response (2 MiB)
+
+[mcp.auth]                      # How callers authenticate to /mcp
+mode = "oauth"                  # "oauth" (default) | "static" | "anonymous"
+
+# mode = "static": SQE issues and verifies the tokens; roles come from the
+# matched principal and there are no OAuth scopes.
+# [[mcp.auth.principals]]
+# user      = "mcp-reader"
+# roles     = ["reader"]
+# token_env = "SQE_MCP_READ_TOKEN"   # preferred; wins over token_b64
+# [[mcp.auth.principals]]
+# user      = "mcp-writer"
+# roles     = ["data_writer"]
+# token_b64 = "..."                  # base64 is encoding, not protection
+
+# mode = "anonymous": every caller becomes one identity. Refused when an IdP
+# provider is configured, under production_mode, and with allow_writes = true.
+# [mcp.auth.anonymous]
+# user  = "mcp-anonymous"
+# roles = ["reader"]
 
 [worker]
 coordinator_url = "http://coordinator:50051"
@@ -43,10 +96,39 @@ advertise_url = ""              # URL the coordinator uses to reach this worker.
                                 # Empty -> auto-derived (POD_IP, else HOSTNAME if
                                 # an IP, else first non-loopback interface). Never
                                 # advertise 0.0.0.0; the coordinator rejects it.
+                                # Under TLS this must be a hostname the worker
+                                # certificate covers, unless allow_ip_advertise.
 heartbeat_interval_secs = 5     # Health check interval
 memory_limit = "8GB"            # Worker memory limit (supports B/KB/MB/GB/TB)
 spill_to_disk = true            # Allow spilling large sorts/joins to disk
 spill_dir = "/tmp/sqe-spill"    # Temp directory for spilling
+
+# [worker.spill]                # Optional. backend = "local" (default), "s3", or "tiered"
+# backend = "s3"                # (local disk first, S3 behind it). s3 and tiered require
+# [worker.spill.s3]             # the bucket below.
+# bucket = "sqe-spill-prd"      # MUST be a bucket dedicated to spill. Startup refuses a
+#                               # bucket that any [[hive.roots]] location or s3:// warehouse
+#                               # in this file also names (#382): spill objects carry the
+#                               # tag sqe-spill=true and are reaped ONLY by a bucket lifecycle
+#                               # rule that expires that tag, which SQE does not create or
+#                               # verify. Provision the rule (and a shorter one for
+#                               # sqe-spill-purpose=spill-partial) before enabling this backend.
+# prefix = "sqe-spill/"         # Must not look like table data (warehouse/, iceberg/, data/, table/)
+compaction_timeout_secs = 3600  # Max wall-clock seconds for do_action("compact_file_group").
+                                # Default: 3600 (1 hour). Set to 0 to disable.
+                                # On expiry, the worker cancels the rewrite, deletes
+                                # uploaded objects, and fails with DeadlineExceeded (finding 608).
+ticket_public_key = ""              # Base64 Ed25519 public key for verifying coordinator scan tickets (finding 601)
+                                # Empty: receive from heartbeat response (normal). Set when heartbeat unavailable.
+accept_hmac_tickets = false     # Accept legacy HMAC-signed scan tickets keyed by worker_secret (finding 601)
+                                # Migration only: off by default. Turn on while rolling pre-Ed25519 coordinators.
+
+# [worker.tls]                  # Optional. Absent means the worker inherits [coordinator.tls].
+# cert_file = ""                # This worker's own certificate, covering its advertise_url
+# key_file = ""
+# ca_file = ""                  # Trust root for the coordinator, and client CA for this listener
+# allow_ip_advertise = false    # Permit a bare-IP advertise_url under TLS (needs IP SANs)
+
 
 [auth]
 keycloak_url = ""               # Keycloak base URL (OIDC password grant mode)
@@ -60,11 +142,25 @@ ssl_verification = true         # Set false for dev (self-signed certs)
 [catalog]
 catalog_url = "http://polaris:8181/api/catalog"   # REST catalog endpoint
 warehouse = "iceberg"           # warehouse identifier the catalog expects
-metadata_cache_ttl_secs = 30    # Table metadata cache TTL
-default_table_format_version = 2 # Iceberg table format version (2 or 3)
+metadata_cache_ttl_secs = 30    # Table metadata cache TTL; each table is revalidated
+                                # after 80-100% of it, so tables cached together
+                                # do not all revalidate at once
+default_table_format_version = 3 # Iceberg table format version (2 or 3); 2 for
+                                # Trino < 481 / Spark < 4.0 / Iceberg < 1.10 readers
 trust_sort_order = false        # Trust Iceberg sort order for all columns, not just partition keys
 small_file_threshold_mb = 3     # Max file size for the direct-read fast path (0 to disable)
 parquet_compression = "zstd"    # Write-path Parquet codec: zstd, lz4, snappy, none
+access_delegation = "none"      # "none" or "vended-credentials": send X-Iceberg-Access-Delegation so
+                                # the catalog vends table-scoped keys, which beat [storage] keys
+require_vended_credentials = false # When true, FileIO never gets [storage] keys (issue #395); implies
+                                # access_delegation = "vended-credentials"
+tvf_prefixes = []               # Extra object-store prefixes file TVFs may read in sessions
+                                # scoped to THIS catalog only; added to [storage.tvf]
+                                # allowed_object_store_prefixes. Also on [catalogs.<name>].
+                                # Opens only when the catalog answered the caller's own
+                                # bearer (per-user REST auth), never on the name alone.
+                                # Entries here and in the global list expand {user} and
+                                # {catalog} (the session catalog, under the same proof).
 
 # `catalog_url` accepts any Iceberg REST endpoint. SQE has been
 # verified live against Apache Polaris, Project Nessie 0.107+,
@@ -131,8 +227,7 @@ backend = "none"                # none (default) | polaris | ranger | chameleon
 
 [policy]
 # Fine-grained enforcement engine (row filters + column masks).
-# Wired: passthrough (default), in-memory, ranger.
-# opa and cedar are defined but not yet wired; selecting them errors at startup.
+# One of: passthrough (default), in-memory, ranger.
 engine = "passthrough"
 
 [session]
@@ -150,16 +245,41 @@ timeout_secs = 300              # 5 min, max execution time per query
 max_result_rows = 1000000       # Max rows per query (0 = unlimited)
 max_concurrent_queries = 100    # Concurrency limit (0 = unlimited)
 max_query_memory = "256MB"      # Per-query memory limit
+pressure_admission_memory = "64MB" # Per-query cap for a read admitted while the coordinator
+                                # pool is red (>95% used). SHOW/DESCRIBE/EXPLAIN pass at red;
+                                # every statement that is neither a read nor one of those
+                                # (writes, DDL, SET, BEGIN/COMMIT/ROLLBACK) is refused.
+                                # "0" refuses reads too.
 slow_query_threshold_secs = 30  # WARN-log threshold for slow queries
 distribution_threshold = "128MB" # Min scan size to distribute to workers
 distribution_file_threshold = 4 # Min file count to distribute
 target_task_size = "256MB"      # Target scan task size for bin-packing
+distribution_fallback = "error" # "error" (default) fails a query whose scan could not be
+                                # distributed (manifest listing, scheduling, plan rebuild);
+                                # "local" logs it and runs the scan on the coordinator.
+                                # Policy skips (below threshold, no workers) always run
+                                # locally and are counted in
+                                # sqe_scheduler_decisions_total{decision="local",reason=...}
+join_fallback = true            # A read query whose hash join exhausts max_query_memory before
+                                # its first row is planned once more with sort-merge joins,
+                                # which spill, and run on the coordinator. Needs spill_to_disk.
+                                # Counted in sqe_join_fallback_total{outcome}.
+memory_rerun = true             # A read query the coordinator pool refuses before its first row,
+                                # with room left under max_query_memory, waits until the pool can
+                                # hold a full max_query_memory (at most half the pool) and runs
+                                # again on the coordinator, one rerun at a time; the wait ends at
+                                # timeout_secs. outcome="rerun" / "rerun_timeout".
 sort_mode = "adaptive"          # "adaptive", "partition_only", or "strict"
+max_cartesian_rows = 10000000000 # Refuse a read whose cross join or nested-loop join (no
+                                # equal-key condition) would evaluate more row pairs than this,
+                                # judged from the inputs' row-count statistics before it runs.
+                                # Joins run on the coordinator. An input without statistics is
+                                # admitted. 0 = no limit.
 
 # Write-path memory safety (see Features -> Write Path)
 write_buffer_tracking = true    # Pool-track write buffers; big writes fail with ResourceExhausted, not OOM
-fanout_max_open_writers = 0     # Cap on open per-partition writers (0 = auto: pool-derived, 8..64); opt-in bounded fanout
-fanout_buffer_budget = "0"      # Byte budget for buffered fanout memory, "512MB" style (0 = auto); opt-in bounded fanout
+fanout_max_open_writers = 0     # Cap on open per-partition writers (0 = auto: pool-derived, 8..1024)
+fanout_buffer_budget = "0"      # Byte budget for buffered fanout memory, "512MB" style (0 = auto: pool/8)
 merge_target_streaming = false  # Stream CoW MERGE target from files instead of buffering (opt-in, needs write_buffer_tracking)
 
 [query.role_overrides]          # Per-role timeout overrides (seconds)
@@ -167,19 +287,54 @@ merge_target_streaming = false  # Stream CoW MERGE target from files instead of 
 # analyst = 600                 # Analysts get 10 minutes
 
 [query_cache]
-enabled = false                 # Enable query result caching
+enabled = false                 # Enable query result caching (disabled by default under policy engines)
 max_memory_mb = 128             # Total cache memory budget
 max_entry_mb = 5                # Max size per cached result
 ttl_secs = 300                  # Cache entry TTL
+# Cache semantics under policy engines (Ranger, in-memory, plan rewriter):
+# Each cached entry is bound to the policy fingerprint active when it was produced.
+# A policy change (bundle update, row filter tighten, new mask) makes older entries
+# misses. ALTER TABLE and RENAME evict everything (tag-based masks live on the table,
+# outside the fingerprint), as do CREATE and DROP VIEW. Tables or views changed from
+# another engine are only seen after ttl_secs; keep it short if such views restrict
+# access. Engines without a fingerprint keep the cache off.
+# PassthroughEnforcer has a constant fingerprint, so cache works normally.
 
 [query_history]
 max_entries = 10000             # Max queries retained in history
 ttl_secs = 1800                 # History entry TTL (30 min)
 
 [rate_limit]
-enabled = false                 # Enable per-user and global rate limiting
+enabled = false                 # Enable every limiter below
+# Statements a caller asked for: Flight SQL, Trino HTTP, and the MCP tools
+# execute_sql_readonly, sample_rows, execute_sql_change, refresh_metadata.
 per_user_queries_per_minute = 60
 global_queries_per_minute = 1000
+# Metadata browsing: Flight SQL GetTables/GetSchemas and one charge per MCP
+# metadata tool call (list_*, describe_*, search_tables, get_table_*,
+# explain_query). The SHOW statements a tool issues inside one call are not
+# charged, so a search over 135 schemas costs one unit, not 136.
+metadata_per_user_per_minute = 120
+# Credential presentations per (peer, principal) before any provider runs;
+# the per-peer budget is five times this. Denials are 429 with Retry-After
+# and a JSON body naming the limiter, the window and these knobs.
+auth_attempts_per_minute = 10
+# How many presentations one (peer, principal) may make at once before the
+# rate applies: an MCP agent fans a dozen metadata calls out in one second.
+auth_burst = 20
+
+[quack_client]
+enabled = false                 # Enable quack_query(uri, sql) TVF (finding 604). Disabled by default: SSRF risk.
+allowed_roles = []              # Roles permitted to call quack_query; must be non-empty when enabled
+allowed_hosts = []              # Exact host:port allow-list for quack_query targets; must be non-empty when enabled
+max_result_bytes = 67108864     # Byte cap for quack_query results (default 64 MiB); enforced while decoding chunks
+
+# When enabled, quack_query(uri, sql) takes exactly two arguments (URI string and SQL string).
+# The session's own bearer token is forwarded; no SQL-literal tokens accepted.
+# Destinations are validated against allowed_hosts before any socket is opened.
+# Loopback, link-local (169.254.x.x), and private (10/172.16/192.168) addresses must be listed explicitly.
+
+
 
 [metrics]
 prometheus_port = 9090          # Prometheus /metrics endpoint
@@ -187,6 +342,14 @@ otlp_endpoint = ""              # OTLP gRPC endpoint (empty = disabled)
 traces_otlp_endpoint = ""       # trace-only OTLP gRPC endpoint
 trace_sample_rate = 0.01         # 0.0 to 1.0
 audit_log_path = ""             # Audit JSONL file (empty = disabled)
+
+[metrics.audit]
+format = "native"               # native | ocsf | both
+queue_capacity = 10000          # bounded writer queue; drops increment
+                                # sqe_audit_events_dropped_total{reason="queue_full"}
+fail_mode = "open"              # open: drop events and keep serving
+                                # closed: QueryHandler refuses new statements
+                                # when the queue is full or the writer is gone
 
 # Advisory / active auto-compaction (Phase 4a+). Off by default: no
 # maintenance principal is constructed and no scheduler task runs
@@ -211,7 +374,12 @@ enabled = false                 # in-process tick loop off by default; drive via
 tick_secs = 60                  # how often the loop wakes up when enabled
 schedule = "0 2 * * *"          # global default cron; per-table property overrides
 jitter_secs = 900               # per-table jitter so a fleet doesn't all fire at once
-max_concurrent_jobs = 1
+max_concurrent_jobs = 1         # bounded concurrency: 1 compaction at a time by default
+                                # increases parallelism when > 1 (discovery cache allows this).
+                                # Discovery caches properties per table across ticks.
+discovery_cache_ticks = 5       # How many scheduler ticks a table's cached properties stay fresh.
+                                # 0 is treated as 1 (re-load every tick). Discovery
+                                # lists all tables every tick to detect new tables and changes.
 lease = "catalog"               # "none" | "catalog" | "kubernetes"
 lease_ttl_secs = 300
 state_table = "sqe_system.maintenance_log"  # operator-created; see note below
@@ -221,6 +389,7 @@ single_scheduler_acknowledged = false       # required true for enabled=true + l
 target_file_size_bytes = 536870912   # 512 MiB
 min_input_files = 5
 delete_file_threshold = 2
+delete_ratio_threshold = 0.0      # 0 < r <= 1 rewrites files with that share of rows deleted (V3); 0 = off
 strategy = "binpack"             # "binpack" | "sort" | "zorder"
 
 [maintenance.distribution]
@@ -269,6 +438,8 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_CATALOG__CATALOG_URL` | `catalog.catalog_url` | string |
 | `SQE_CATALOG__POLARIS_URL` | `catalog.catalog_url` (legacy alias) | string |
 | `SQE_CATALOG__WAREHOUSE` | `catalog.warehouse` | string |
+| `SQE_CATALOG__ACCESS_DELEGATION` | `catalog.access_delegation` | `none` / `vended-credentials` |
+| `SQE_CATALOG__REQUIRE_VENDED_CREDENTIALS` | `catalog.require_vended_credentials` | bool |
 | `SQE_CATALOG__METADATA_CACHE_TTL_SECS` | `catalog.metadata_cache_ttl_secs` | u64 |
 | `SQE_CATALOG__DEFAULT_TABLE_FORMAT_VERSION` | `catalog.default_table_format_version` | u8 |
 | **Storage** | | |
@@ -284,38 +455,78 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_SESSION__ABSOLUTE_TIMEOUT_SECS` | `session.absolute_timeout_secs` | u64 |
 | **Query** | | |
 | `SQE_QUERY__TIMEOUT_SECS` | `query.timeout_secs` | u64 |
+| `SQE_QUERY__MAX_CARTESIAN_ROWS` | `query.max_cartesian_rows` | u64 |
 | **Rate Limit** | | |
 | `SQE_RATE_LIMIT__ENABLED` | `rate_limit.enabled` | bool |
 | `SQE_RATE_LIMIT__PER_USER_QUERIES_PER_MINUTE` | `rate_limit.per_user_queries_per_minute` | u32 |
 | `SQE_RATE_LIMIT__GLOBAL_QUERIES_PER_MINUTE` | `rate_limit.global_queries_per_minute` | u32 |
+| `SQE_RATE_LIMIT__METADATA_PER_USER_PER_MINUTE` | `rate_limit.metadata_per_user_per_minute` | u32 |
+| `SQE_RATE_LIMIT__AUTH_ATTEMPTS_PER_MINUTE` | `rate_limit.auth_attempts_per_minute` | u32 |
+| `SQE_RATE_LIMIT__AUTH_BURST` | `rate_limit.auth_burst` | u32 |
 | **Metrics** | | |
 | `SQE_METRICS__PROMETHEUS_PORT` | `metrics.prometheus_port` | u16 |
 | `SQE_METRICS__OTLP_ENDPOINT` | `metrics.otlp_endpoint` | string |
 | `SQE_METRICS__TRACES_OTLP_ENDPOINT` | `metrics.traces_otlp_endpoint` | string |
 | `SQE_METRICS__TRACE_SAMPLE_RATE` | `metrics.trace_sample_rate` | f64 |
 | `SQE_METRICS__AUDIT_LOG_PATH` | `metrics.audit_log_path` | string |
+| `SQE_METRICS__AUDIT__QUEUE_CAPACITY` | `metrics.audit.queue_capacity` | usize |
+| `SQE_METRICS__AUDIT__FAIL_MODE` | `metrics.audit.fail_mode` | string (`open` or `closed`) |
 
 Boolean values accept: `true`/`false`, `1`/`0`, `yes`/`no`.
 
 ## TLS
 
-SQE supports optional TLS encryption for the Flight SQL gRPC listener.
+One TLS block configures every SQE listener and every in-cluster client hop: Flight SQL, the worker Flight port, the MCP endpoint, and the DuckDB Quack endpoint.
 
 **Server-side TLS:** Set `cert_file` and `key_file` to enable. When both are set, the server listens on TLS; when omitted, plaintext.
 
-**mTLS (mutual TLS):** Set `ca_file` to a PEM CA bundle. Clients must present a certificate signed by this CA.
+**mTLS (mutual TLS):** Set `ca_file` to a PEM CA bundle. Clients must present a certificate signed by this CA. The requirement applies to all listeners, not only Flight SQL.
+
+**Client side:** `ca_file` is also the trust root the coordinator uses to reach `https://` workers and the worker uses to reach an `https://` coordinator. Without it the client falls back to the platform trust store, which will not contain a private cluster CA. Set `ca_file` on both ends of a cluster that runs its own CA.
+
+Every listener negotiates TLS 1.2 or TLS 1.3 and nothing older. TLS 1.2 stays on the listeners on purpose: older JDBC, ODBC and Python clients still need it, and a client that speaks 1.3 gets 1.3. The outbound OTLP and audit-export connections negotiate TLS 1.3 with any current collector. If your policy requires TLS 1.3 only, enforce it at the ingress in front of SQE.
 
 ```toml
 [coordinator.tls]
 cert_file = "/etc/sqe/server.crt"
 key_file  = "/etc/sqe/server.key"
-ca_file   = "/etc/sqe/ca.crt"    # Optional: enables mTLS
+ca_file   = "/etc/sqe/ca.crt"    # Optional: enables mTLS, and is the client trust root
 ```
+
+### Per-worker certificates
+
+Workers inherit `[coordinator.tls]` by default, which is the single-cert development setup. In a real cluster the coordinator's certificate cannot validate for a worker's own URL, so give each worker its own identity:
+
+```toml
+[worker.tls]
+cert_file = "/etc/sqe/worker.crt"
+key_file  = "/etc/sqe/worker.key"
+ca_file   = "/etc/sqe/ca.crt"
+# allow_ip_advertise = true   # only when the certificate carries IP SANs
+```
+
+With TLS on, `worker.advertise_url` must resolve to a hostname. A worker that would advertise a bare IP, which is what the default `POD_IP` derivation produces, refuses to start: the coordinator verifies the worker certificate against the address it dials. Set `advertise_url` to the pod's DNS name, or set `allow_ip_advertise = true` when the certificate really does carry the IP SANs.
+
+### Certificate rotation
+
+The HTTP listeners (MCP, Quack, and the Trino HTTPS port with `[coordinator.trino_tls]`) poll `cert_file` and `key_file` every 60 seconds and swap the certificate in place. A cert-manager renewal is picked up within about a minute, with no dropped connections and no restart. A half-written pair is rejected and retried on the next poll, so the listener never serves a mismatched cert and key.
+
+The Flight (gRPC) listener does not do this. tonic builds its TLS acceptor once at startup and offers no way to replace it on a live server, so the Flight port keeps serving the certificate it booted with. Cover that in Kubernetes with a reloader sidecar that restarts the pod when the TLS secret changes:
+
+```yaml
+metadata:
+  annotations:
+    reloader.stakater.com/auto: "true"
+```
+
+With `coordinator.shutdown_drain_secs` set, that restart drains in-flight queries at the graceful boundary instead of killing them.
 
 Validation rules:
 - If either `cert_file` or `key_file` is set, both must be set
 - All referenced files must exist when TLS is enabled
-- `ca_file` is optional -- when set, it must also exist
+- `ca_file` is optional; when set, it must also exist
+- The same shape rules apply to `[worker.tls]`
+- TLS on with `https://` entries in `coordinator.worker_urls` requires a client trust root, either `ca_file` or the platform store
 
 ## Authentication Modes
 
@@ -360,8 +571,10 @@ Each entry requires a `type`:
 | `token_exchange` | `token_url`, `client_id` | RFC 8693 token exchange |
 | `aws_iam` | none | AWS IAM via STS `GetCallerIdentity` |
 | `api_key` | `keys_file` | API key from a TOML keys file |
-| `mtls` | none | Client certificate authentication |
+| `mtls` | none | Reserved; startup rejects it because current listeners do not extract verified peer identities |
 | `anonymous` | none | Fixed identity for dev / test |
+
+The `mtls` auth provider is reserved. Transport mutual TLS through the configured client CA still verifies client certificates, but current adapters do not map those certificates to a SQL identity.
 
 A common production chain accepts both interactive logins (password grant) and pre-minted JWTs from programmatic clients:
 
@@ -379,15 +592,31 @@ jwks_url = "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/
 issuer = "https://keycloak.example.com/realms/iceberg"
 ```
 
+**Bearer Token Provider Options (finding 207):**
+
+```toml
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://keycloak.example.com/realms/iceberg/protocol/openid-connect/certs"
+issuer = "https://keycloak.example.com/realms/iceberg"  # Required unless allow_unbounded_issuer = true
+leeway_secs = 60                                        # Clock skew tolerance (default 60)
+allow_unbounded_issuer = false                          # Allow missing/empty issuer (dev/test only)
+```
+
+- `issuer`: Required. The OIDC `iss` claim must match this value. Required unless `allow_unbounded_issuer = true`. When omitted, SQE fails at startup.
+- `leeway_secs`: Clock skew tolerance for token validation, including `exp`, `nbf` and `iat` claims. Default 60 seconds.
+- `allow_unbounded_issuer`: Opt-out for development. Allows tokens without issuer validation. Never set in production.
+- EC keys (`ES256`, `ES384`) are supported automatically. Keys are pinned per-entry based on the JWK `alg` field.
+
+
 Auth0 and Okta use the same two-provider shape, differing only in `token_url`, `jwks_url`, `issuer`, and the `roles_claim` path (Auth0 uses a namespaced claim, Okta uses `groups`).
 
-AWS IAM maps caller ARNs to SQE roles:
+AWS IAM verifies every access key and secret with STS `GetCallerIdentity`, then maps the caller ARN to SQE roles. There is no config-only mode: `validate_with_sts = false` fails at startup.
 
 ```toml
 [[auth.providers]]
 type = "aws_iam"
 region = "eu-example-2"
-validate_with_sts = true
 
 [auth.role_mappings]
 "arn:aws:iam::123456789012:role/DataAnalyst" = ["analyst", "reader"]
@@ -406,6 +635,7 @@ key_prefix = "sqe_"
 ```toml
 # api-keys.toml
 [[keys]]
+# nosemgrep: opt.aikido.semgrep-rules.generic.secrets.gitleaks.generic-api-key -- placeholder value
 key = "sqe_abc123def456"
 user = "service-account-etl"
 roles = ["writer"]
@@ -435,16 +665,12 @@ user = "dev-user"
 roles = ["admin"]
 ```
 
-For CLI logins without a username and password, configure the interactive device-code flow under `[auth.external]`:
+For browser-based logins without a username and password, configure the OAuth2 authorization-code flow under `[auth.external]`:
 
 ```toml
 [auth.external]
 issuer = "https://keycloak.example.com/realms/iceberg"
 client_id = "sqe-cli"
-scopes = ["openid", "profile"]
-
-[auth.external.device]
-client_id = "sqe-cli-device"
 scopes = ["openid", "profile"]
 ```
 
@@ -616,10 +842,12 @@ coordinator's config file, via `ALTER TABLE ... SET TBLPROPERTIES`:
 | `sqe.maintenance.compaction.target-file-size-bytes` | `maintenance.compaction.target_file_size_bytes` |
 | `sqe.maintenance.compaction.min-input-files` | `maintenance.compaction.min_input_files` |
 | `sqe.maintenance.compaction.delete-file-threshold` | `maintenance.compaction.delete_file_threshold` |
+| `sqe.maintenance.compaction.delete-ratio-threshold` | `maintenance.compaction.delete_ratio_threshold` |
 | `sqe.maintenance.compaction.strategy` | `maintenance.compaction.strategy` |
 
 An absent or blank property falls back to the global config value. A
-numeric override that fails to parse also falls back to the global
+numeric override that fails to parse (or, for the ratio, falls outside 0
+to 1) also falls back to the global
 value; the scheduler logs a warning naming the property and the rejected
 value rather than failing the whole tick over one bad property on one
 table. In active mode the resolved, per-table value is what both gates

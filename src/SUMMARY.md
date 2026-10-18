@@ -15,6 +15,7 @@
 # Architecture
 
 - [System Overview](./architecture/overview.md)
+- [System Context and Inventory](./architecture/system-context.md)
 - [Coordinator](./architecture/coordinator.md)
 - [Worker](./architecture/worker.md)
 - [Authentication Flow](./architecture/auth-flow.md)
@@ -38,7 +39,7 @@
 - [Access control: support matrix](./features/access-control-matrix.md)
 - [Access control: evaluation order, engine by engine](./features/access-control-evaluation-order.md)
 - [read\_parquet TVF](./features/read-parquet.md)
-- [File-format TVFs (read\_csv / read\_json / read\_delta)](./features/file-format-tvfs.md)
+- [File-format TVFs (read\_csv / read\_json)](./features/file-format-tvfs.md)
 - [Observability](./features/observability.md)
 - [Trino Compatibility](./features/trino-compatibility.md)
 - [Benchmark Suite](./features/benchmarks.md)
@@ -77,6 +78,7 @@
 - [Limitations and Known Gaps](./reference/limitations.md)
 - [SQL at a glance](./reference/sql-cheatsheet.md)
 - [SQE vs Trino, DuckDB, Spark](./reference/vs-other-engines.md)
+- [Hive External Tables](./reference/hive-external-tables.md)
 
 ---
 
@@ -88,6 +90,7 @@
 - [Storage backends (S3 / R2 / GCS / ADLS / HTTPS / hf://)](./getting-started/storage-backends.md)
 - [Building from Source](./getting-started/building.md)
 - [Using the CLI](./getting-started/cli.md)
+- [Run SQE as an MCP server](./getting-started/mcp-server.md)
 
 ---
 
@@ -96,9 +99,12 @@
 - [Overview](./quickstart/index.md)
 - [Polaris + Keycloak (client credentials)](./quickstart/polaris-keycloak-client-id.md)
 - [Polaris + Keycloak (user token)](./quickstart/polaris-keycloak-user-token.md)
+- [MCP with Codex and Claude](./quickstart/mcp.md)
+- [MCP with Ranger and Okta on external data](./quickstart/mcp-ranger-okta.md)
 - [Polaris + Ranger + Keycloak (fine-grained masking + Spark parity)](./quickstart/polaris-ranger-keycloak.md)
 - [Polaris + Ranger (service principal)](./quickstart/polaris-ranger-service-principal.md)
 - [Project Nessie (Iceberg REST catalog)](./quickstart/nessie.md)
+- [RustFS S3 Tables (Iceberg REST catalog inside the object store)](./quickstart/rustfs-s3tables.md)
 - [Unity Catalog OSS (Iceberg REST, read-only)](./quickstart/unity-oss.md)
 - [AWS S3 Tables (managed Iceberg)](./quickstart/aws-s3-tables.md)
 - [AWS Glue Data Catalog](./quickstart/aws-glue.md)
@@ -119,6 +125,7 @@
 # Deployment
 
 - [Configuration](./deployment/configuration.md)
+- [Model Context Protocol](./deployment/mcp.md)
 - [Sizing and capacity](./deployment/sizing.md)
 - [Docker](./deployment/docker.md)
 - [Kubernetes & Helm](./deployment/kubernetes.md)
@@ -132,7 +139,11 @@
 - [Audit Logging (OCSF)](./operations/audit-logging.md)
 - [Web UI](./operations/web-ui.md)
 - [On-Call Runbook](./operations/runbook.md)
+- [Secret inventory and rotation](./operations/secret-rotation.md)
+- [Backup and restore](./operations/backup-restore.md)
 - [Production guide (scaling phases)](./operations/production-guide.md)
+- [Shared responsibility](./operations/shared-responsibility.md)
+- [Go-live and retirement checklists](./operations/go-live-checklist.md)
 
 ---
 

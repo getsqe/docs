@@ -46,7 +46,18 @@ files regardless of strategy:
   delete files applying to it, even if the file is already at or above the
   target size. The threshold is the lever for delete-heavy Merge-on-Read
   tables, where the file itself is fine but every scan pays to apply a
-  stack of deletes against it.
+  stack of deletes against it. On a format-version 3 table each data file
+  has at most one deletion vector, so a threshold above 1 counts only
+  equality deletes (see
+  [Procedures](../sql-reference/procedures.md)).
+- **`delete_ratio_threshold => R`**. Rewrites any data file whose deleted
+  rows are at least share R of its rows (0 < R <= 1), counted from its
+  deletion vector or from V2 position delete files written for that one
+  file. This is the delete trigger for format-version 3 tables. 0.3, the
+  default of Spark's `delete-ratio-threshold`, is a reasonable start. The
+  scheduler reads it from `[maintenance.compaction] delete_ratio_threshold`
+  (off by default) or from the table property
+  `sqe.maintenance.compaction.delete-ratio-threshold`.
 - **`rewrite_all => true`**. Forces a rewrite of every data file, including
   files already at or above the target size and partitions below
   `min_input_files`. It applies all deletes and re-encodes at the target
@@ -62,6 +73,26 @@ deciding whether to run one. It reports live and small file counts, delete
 and delete-heavy file counts, eligible bin-pack groups, and estimated
 rewrite bytes. See [CALL procedures](../sql-reference/procedures.md) for
 the full argument list and column reference for both procedures.
+
+## Scheduler efficiency
+
+The maintenance scheduler discovers tables, dispatches compactions, and maintains a ledger.
+Key efficiency tuning:
+
+- **Discovery cache** (`[maintenance.scheduler] discovery_cache_ticks`, default 5). Every scheduler
+  tick lists all tables to detect new additions and removals (the discovery signal). Properties
+  of already-listed tables are cached across ticks; a cached entry younger than `discovery_cache_ticks`
+  is reused, avoiding redundant `load_table` calls. Stale cached properties are safe: the compaction
+  job itself re-loads the table fresh before running, so no rewrite can use stale parameters. A
+  `load_table` failure preserves the existing entry rather than evicting it.
+- **Bounded concurrency** (`[maintenance.scheduler] max_concurrent_jobs`, default 1). Due tables
+  are spawned onto a job queue sized by this knob. The tick returns immediately after queueing;
+  concurrency no longer blocks the health reporting loop. A table with a job already in flight
+  is skipped on the next tick. Default 1 preserves historical one-at-a-time compaction; increase
+  it to parallelize compactions across tables when network or compute allows.
+- **Ledger deduplication** (`sqe_system.maintenance_log`). Consecutive `skipped` rows for the same
+  table and reason within a schedule window are deduplicated, keeping the ledger size manageable.
+  Old rows are compacted daily into one file per day during a retention pass, run by the scheduler.
 
 ## Autonomy: advisory before active
 
@@ -132,6 +163,16 @@ very large tables, at the cost of a larger commit-conflict surface. See
 [Distributed compaction](../design-notes/distributed-compaction.md) for
 the full planning, dispatch, and commit flow, including the
 partial-progress commit model.
+
+**Worker-side safeguards.** Workers enforce a `[worker] compaction_timeout_secs`
+deadline (default 3600, 1 hour) on every compaction rewrite. On expiry or
+cancellation (coordinator drops the RPC), the worker best-effort deletes the
+partial uploads it recorded, reports the leaked paths in the error details so
+the coordinator can retry cleanup, and fails with `DeadlineExceeded`. The
+age-thresholded orphan sweep remains the backstop for any paths that escaped
+cleanup. Dropped responses to the RPC abort the rewrite immediately instead of
+running detached, ensuring a coordinator restart does not leave zombie rewrites
+burning memory and S3 bandwidth.
 
 ## High availability
 

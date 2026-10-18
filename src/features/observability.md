@@ -13,6 +13,11 @@ Available at `http://coordinator:9090/metrics` in Prometheus text format.
 | `sqe_rows_returned_total` | Counter | — | Cumulative rows returned |
 | `sqe_active_queries` | Gauge | none | Queries that have not reached a terminal state |
 | `sqe_active_sessions` | Gauge | — | Current active sessions |
+| `sqe_transactions_open` | Gauge | none | Explicit transactions open on this coordinator |
+| `sqe_transactions_ended_total` | Counter | `outcome` | Ended transactions: `committed`, `rolled_back`, `conflict`, `idle_timeout`, `lifetime`, `session_ended`, `shutdown` |
+| `sqe_transaction_duration_seconds` | Histogram | none | Seconds from a transaction's first statement to its end |
+| `sqe_transaction_not_found_total` | Counter | none | Statements refused because their transaction belongs to another coordinator or to this one before a restart |
+| `sqe_transaction_branch_drop_failures_total` | Counter | none | Transaction branches a rollback or abort could not drop |
 | `sqe_healthy_workers` | Gauge | — | Workers passing health checks |
 | `sqe_scan_files_total` | Counter | `outcome` | Iceberg files planned, read, or pruned |
 | `sqe_scan_bytes_total` | Counter | `stage` | Iceberg bytes planned and read |
@@ -45,6 +50,34 @@ histogram_quantile(0.99, rate(sqe_query_duration_seconds_bucket[5m]))
 sqe_active_sessions
 ```
 
+### Distributed scan tickets
+
+Every fragment of a distributed scan travels to its worker as one `ScanTask` ticket: file list, projection, predicate, storage settings and credentials. The coordinator encodes a ticket per dispatch attempt, and when dynamic join filters are in play it first decodes each partition's predicate, ANDs in the filter snapshots and serializes it again. Three histograms measure that cost.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `sqe_scan_ticket_bytes` | Histogram | none | Size of each ticket sent to a worker, after a predicate that would break the message ceiling is dropped. One sample per dispatch attempt, so retries count again |
+| `sqe_scan_ticket_encode_seconds` | Histogram | none | Coordinator time to serialize one ticket, including the re-encode without the predicate |
+| `sqe_scan_ticket_dynamic_filter_seconds` | Histogram | none | Coordinator time per partition to AND dynamic filters into the ticket predicate and serialize it again. The bounded wait for the join builds is excluded |
+| `sqe_scheduler_task_count` | Histogram | none | Tickets planned per distributed Iceberg scan |
+
+Byte buckets run from 1 KiB to 16 MiB, the default gRPC message ceiling. Time buckets run from 10 microseconds to 1 second. The `_sum` series are CPU time spent across concurrent partitions, not wall time, so compare them with query time as a share of work, not as latency.
+
+```promql
+# Ticket size p50 and p99 over a run
+histogram_quantile(0.5, sum(increase(sqe_scan_ticket_bytes_bucket[1h])) by (le))
+histogram_quantile(0.99, sum(increase(sqe_scan_ticket_bytes_bucket[1h])) by (le))
+
+# Ticket work as a share of query time
+(sum(increase(sqe_scan_ticket_encode_seconds_sum[1h]))
+  + sum(increase(sqe_scan_ticket_dynamic_filter_seconds_sum[1h])))
+/ sum(increase(sqe_query_duration_seconds_sum[1h]))
+
+# Encodes per planned ticket (above 1 means retries)
+increase(sqe_scan_ticket_encode_seconds_count[1h])
+/ increase(sqe_scheduler_task_count_sum[1h])
+```
+
 ### Local observability stack
 
 For a self-contained metrics view alongside the test stack, SQE ships a Docker Compose overlay using VictoriaMetrics (Prometheus-compatible, around 30 MB RAM) and Grafana:
@@ -64,31 +97,76 @@ Available on port 9091 (metrics port + 1) for both coordinator and workers.
 
 | Endpoint | Purpose | Response |
 |---|---|---|
-| `GET /healthz` | Liveness probe | Always returns `200 ok` |
-| `GET /readyz` | Readiness probe | `200` when ready, `503` during init |
+| `GET /healthz` | Liveness probe | `200 ok`; `503 mcp listener down` once a dedicated `/mcp` listener's serve task has ended |
+| `GET /readyz` | Readiness probe | `200` when ready, `503` during init or when a check fails; `checks.mcp` is `ok` or `down` when MCP has its own port |
+
+A dedicated MCP listener (`[mcp] port` > 0) is supervised: if its accept loop
+ends for any reason, including a panic, the coordinator logs at ERROR, clears
+the liveness flag both probes read, flips readiness so a load balancer stops
+routing, and exits with status 70 so the supervisor restarts the process. A
+process that stays up with a closed `/mcp` is the one failure no external
+health check can see, so `sqe-server` does not stay up in that state. With
+`port = 0` the MCP routes share this listener and answering `/healthz` already
+proves them reachable.
 
 ### Cluster Status (Ballista/DataFusion-style)
 
-`GET /api/v1/status` returns a JSON snapshot of the node and cluster:
+`GET /api/v1/status` is open (no auth) and returns only the lifecycle state and
+role, for probes and load balancers:
+
+```json
+{"status": "ACTIVE", "node": {"role": "coordinator"}}
+```
+
+`GET /api/v1/status/detail` returns the full snapshot of the node and cluster.
+It is registered on a coordinator only and needs `Authorization: Bearer <token>`
+for an identity holding an admin role (401 without a valid token, 403 for a
+non-admin one):
 
 ```json
 {
   "status": "ACTIVE",
   "node": {
     "role": "coordinator",
-    "version": "0.1.0",
-    "datafusionVersion": "51",
+    "version": "0.48.1",
+    "gitSha": "9525cbb8d1e2",
+    "buildProfile": "release",
+    "datafusionVersion": "55.1.0",
     "uptimeSeconds": 3600
   },
   "workers": {
     "total": 2,
     "healthy": 2,
     "healthyUrls": ["http://worker-0:50052", "http://worker-1:50052"]
+  },
+  "serving": {
+    "mode": "full",
+    "flightSqlPort": 50051,
+    "trinoHttpPort": 8080,
+    "quackPort": null,
+    "mcp": {"port": 8099, "authMode": "oauth", "allowWrites": false},
+    "policyEngine": "ranger",
+    "catalogs": [
+      {"name": "glue", "kind": "hive-glue"},
+      {"name": "iceberg", "kind": "rest"}
+    ]
   }
 }
 ```
 
-For worker nodes, the `workers` field is `null`.
+`datafusionVersion` is the version of the DataFusion library the binary was
+linked against. `serving` describes what the process answers: `mode` is
+`mcp-only` when every SQL front door is closed and only `/mcp` is open
+(`--mcp-only`), the port fields are `null` for a disabled listener, `mcp` is
+`null` when MCP is off and otherwise names the auth mode (`oauth`, `static`,
+`anonymous`) and whether writes are advertised, `policyEngine` is the
+`[policy] engine` value, and `catalogs` lists every attached catalog with its
+kind (`rest`, `hms`, `glue`, `jdbc`, `s3tables` for Iceberg catalogs;
+`hive-glue` or `hive-sidecar` for Hive roots, including `--glue-catalog`). It is
+fixed at startup from the effective configuration, flags included.
+
+On a worker, `/api/v1/status/detail` is not registered; the open
+`/api/v1/status` reports `"role": "worker"`.
 
 ### Trino-Compatible Info (port 8080)
 
@@ -120,7 +198,7 @@ Configuration:
 [metrics]
 # Trace-only collector. Recommended when /metrics is scraped and stdout logs
 # are collected separately.
-traces_otlp_endpoint = "http://otel-collector:4317"
+traces_otlp_endpoint = "https://otel-collector:4317"
 trace_sample_rate = 1.0
 
 # Legacy all-signals endpoint. Leave empty for the trace-only setup above.
