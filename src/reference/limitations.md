@@ -51,11 +51,11 @@ V3 is the default format-version for new tables and landed end to end: default v
 
 | Feature | Status |
 |---|---|
-| Geometry / geography types | Not supported. No SQE type and no DataFusion user-defined-type support. |
+| Geometry / geography types | Created with DDL, read and written as WKB bytes. The `ST_*` functions are planar only and refuse `GEOGRAPHY` unless wrapped ([Geospatial](../sql-reference/geospatial.md)). A geospatial predicate does not prune files, and a geospatial type cannot be nested in a `STRUCT`, `ARRAY` or `MAP`. |
 | Multi-arg partition transforms | Not supported. `PARTITIONED BY` accepts single-source transforms only. |
-| Variant path functions (`variant_get`) | Not supported. Read fields through the variant's JSON text with the `json*` functions. |
-| Shredded variant writes | SQE reads shredded variant files written by other engines, but writes unshredded variants. |
-| Nested unknown fields | `STRUCT<a INT, u VOID>` is refused on write and cannot be read. |
+| Shredded variant reads | SQE writes and reads shredded variants, but unshreds on read: a shredded field gives no pruning or typed access, and only top-level variant columns are shredded on write. |
+| Unknown list elements and map keys/values | `ARRAY<VOID>`, a map with a `VOID` key or value, and a struct whose members are all unknown can be declared and read, but a row cannot be written: Parquet has no column for them, and Iceberg Java refuses the same writes. Unknown struct members (`STRUCT<a INT, u VOID>`) work. |
+| DATE to TIMESTAMP promotion | The Iceberg V3 spec allows it, but `ALTER COLUMN ... SET DATA TYPE` refuses it: Iceberg Java (Spark 4.1) refuses the same change, so no other engine could read the table afterwards. A map key never changes type. |
 
 See [Iceberg Integration, V3 features verified](../features/iceberg.md#v3-features-verified) and [DDL, VARIANT](../sql-reference/ddl.md#variant).
 
@@ -63,7 +63,7 @@ See [Iceberg Integration, V3 features verified](../features/iceberg.md#v3-featur
 
 ### Statements DataFusion's parser does not accept
 
-`PIVOT`, `UNPIVOT`, `ASOF JOIN`, and FROM-first syntax are not parseable. This is tracked upstream, not an SQE bug. `QUALIFY` works. List comprehensions have no AST node in DataFusion; lambdas work in the higher-order array functions (`filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`). The full list, with the reasoning for each, is on the [SQL Reference overview](../sql-reference/index.md#what-is-intentionally-not-in-sqe), and the [SQL cheat-sheet](sql-cheatsheet.md) carries the scannable version.
+`PIVOT`, `UNPIVOT` and `ASOF JOIN` are not parseable. FROM-first works only as a bare `FROM t` (with `ORDER BY` / `LIMIT`) or `FROM t SELECT ...`. This is tracked upstream, not an SQE bug. `QUALIFY` works. List comprehensions have no AST node in DataFusion; lambdas work in the higher-order array functions (`filter`, `transform`, `any_match`, `all_match`, `none_match`, `reduce`). The full list, with the reasoning for each, is on the [SQL Reference overview](../sql-reference/index.md#what-is-intentionally-not-in-sqe), and the [SQL cheat-sheet](sql-cheatsheet.md) carries the scannable version.
 
 ### read_parquet schema and write constraints
 

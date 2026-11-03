@@ -201,7 +201,8 @@ SF10 numbers, the clean-rig methodology, and the per-shape guidance on when dist
 | Backend | Status |
 |---|---|
 | Iceberg REST (Polaris, Lakeformation) | Done - default |
-| Unity Catalog OSS (REST-compatible) | Done |
+| Databricks Unity Catalog (Iceberg REST, user token passthrough) | Done - read, write and DML both ways, live-verified 2026-10-27 |
+| Unity Catalog OSS (REST-compatible) | Done - read-only upstream |
 | Snowflake Horizon (REST-compatible) | Done |
 | AWS Glue | Done |
 | AWS S3 Tables | Done |
@@ -254,7 +255,7 @@ Not yet wired:
 
 ## Phase 7 - Iceberg V3 (Done)
 
-Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 147/162 (90.7%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
+Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 156/162 (96.3%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
 
 ### V3 Features Shipped
 
@@ -263,12 +264,13 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 | Default values (`ALTER TABLE ADD COLUMN ... DEFAULT`) | Done |
 | Schema evolution (`ALTER TABLE ADD/DROP COLUMN`, incl. nested struct fields) | Done |
 | Nanosecond timestamps (`TIMESTAMP_NS`, `TIMESTAMPTZ_NS`) | Done |
-| `VARIANT` columns (unshredded writes, shredded reads; JSON text in and out) | Done |
+| `VARIANT` columns (JSON text in and out, `variant_get`, shredded reads and writes with `write.parquet.shred-variants`) | Done |
 | `JSON` stored as variant on V3 tables; `json*` functions read variants | Done |
 | Compaction trigger on the deleted-row share (`delete_ratio_threshold`), which counts deletion vectors | Done |
 | Partition evolution | Done |
 | Equality deletes + position deletes (MoR) | Done |
 | Deletion vectors (MoR DELETE on V3 writes one vector per data file) | Done |
+| Workers apply position deletes and deletion vectors (equality deletes scan on the coordinator) | Done |
 | Row lineage | Done |
 | Unknown/VOID columns (top-level) | Done |
 
@@ -276,10 +278,9 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 
 | Feature | Status |
 |---|---|
-| Variant path functions (`variant_get`) | SQE work, tracked in #849 |
-| Shredded variant writes | SQE writes unshredded; shredded files read |
-| Nested unknown fields | Refused on write, not readable |
-| Geometry / geography type | DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644) |
+| Pruning and typed access on shredded variant fields | Shredded fields are unshredded on read |
+| DATE to TIMESTAMP promotion | Refused: Iceberg Java refuses it too |
+| Geometry / geography type | Created with DDL, read and written as WKB, geometry bounds in the manifest, 30 `ST_*` functions plus `ST_SRID`. DESCRIBE and SHOW CREATE TABLE print `geometry(4326)` / `geography(4326, karney)`. Bounding-box file pruning not started |
 | Multi-arg partition transforms | Not started |
 
 ### Other Hardening
@@ -302,6 +303,13 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 - Remote sources: `s3://`, `https://`, HuggingFace `hf://` datasets
 - Cross-catalog joins across multiple `--catalog NAME=PATH` mounts
 - Runtime `ATTACH` / `CREATE SECRET` against any of the supported catalog backends
+- `UPDATE`, `DELETE` and `MERGE INTO` on the warehouse and on attached Iceberg catalogs, through the coordinator's write handlers (copy-on-write or merge-on-read per table)
+- `CREATE TABLE` on the warehouse and on attached Iceberg catalogs, through the coordinator's DDL handler: `PARTITIONED BY` transforms, `TBLPROPERTIES` / `WITH` options, nested columns, format version 3 by default
+- Iceberg metadata tables (`"t$snapshots"`, `$history`, `$manifests`, `$files`, `$partitions`, `$refs`) on the warehouse and on attached Iceberg catalogs, read from the catalog the table name is qualified with
+- `ALTER TABLE` on the warehouse and on attached Iceberg catalogs, through the coordinator's DDL handler: column add, drop, rename and type change (nested fields included), `SET TBLPROPERTIES`, partition evolution, identifier fields, branches and tags, `RENAME TO`
+- `SHOW CREATE TABLE` on Iceberg tables, rendered by the same code as on a coordinator: columns, `PARTITIONED BY`, sort order and `TBLPROPERTIES`, and the printed DDL creates the table again
+- Time travel (`FOR VERSION AS OF <snapshot id | 'branch' | 'tag'>`, `FOR TIMESTAMP AS OF`, `FOR SYSTEM_TIME AS OF`) on the warehouse and on attached Iceberg catalogs, resolved by the same code as the coordinator
+- `CREATE [OR REPLACE] VIEW` / `DROP VIEW` on attached Iceberg REST catalogs, stored by the coordinator's view code and read back through the view; `SHOW TABLES` and `information_schema` list them, `SHOW CREATE VIEW` renders the body, the stored body names the warehouse rather than the attach name, and a view that reaches itself fails instead of recursing (on the coordinator too); the SQLite warehouse, which stores no views, refuses them
 - Quack RPC (`sqe-quack-wire` / `sqe-quack-server` / `sqe-quack-client`): a pure-Rust port of DuckDB's BinarySerializer, so DuckDB clients can talk to SQE over HTTP
 
 Full reference: [Embedded CLI](../getting-started/cli.md).
