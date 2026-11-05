@@ -2,7 +2,7 @@
 
 Data Definition Language: schemas, tables, views, columns, partitions, branches, tags. Most statements parse via `sqlparser-rs`; SQE adds branch / tag / partition-evolution syntax that `sqlparser-rs` does not natively understand.
 
-Source: `sqe-sql/src/classifier.rs`, `sqe-sql/src/ddl.rs`, `sqe-sql/src/partition.rs`, `sqe-sql/src/partition_evolution.rs`. Coordinator handlers in `crates/sqe-coordinator/src/catalog_ops.rs`.
+Source: `sqe-sql/src/classifier.rs`, `sqe-sql/src/ddl.rs`, `sqe-sql/src/partition.rs`, `sqe-sql/src/partition_evolution.rs`. Handlers in `sqe-write/src/catalog_ops.rs`.
 
 ## Schema
 
@@ -23,7 +23,7 @@ DROP SCHEMA staging CASCADE;
 
 | Statement | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `CREATE TABLE t (col TYPE [DEFAULT expr], ...)` | `sqlparser-rs` + `sqe-sql` + `sqe-coordinator` | Iceberg V3 column defaults supported. | yes | yes | yes | yes |
+| `CREATE TABLE t (col TYPE [DEFAULT expr], ...)` | `sqlparser-rs` + `sqe-sql` + `sqe-coordinator` | Iceberg V3 column defaults supported. Nested types in the Trino form (`array(integer)`, `map(varchar, bigint)`, `row(x decimal(10,2), y varchar)`) and the Spark form (`ARRAY<INT>`, `MAP<VARCHAR, BIGINT>`, `STRUCT<x INT>`) both work, at any depth (`sqe-sql/ddl_types.rs`). | yes | yes | yes | yes |
 | `CREATE TABLE t (...) PARTITIONED BY (transform(col), ...)` | `sqe-sql/partition.rs` | Partition transforms: `bucket(N, col)`, `truncate(N, col)`, `year(col)`, `month(col)`, `day(col)`, `hour(col)`, identity (just `col`). | partial | - | yes | - |
 | `CREATE TABLE t AS SELECT ...` (CTAS) | `sqlparser-rs` + `sqe-coordinator` | Inferred schema; partitioning via `WITH (partitioning = ARRAY['day(ts)'])`. | yes | yes | yes | yes |
 | `CREATE OR REPLACE TABLE t AS SELECT ...` | `sqlparser-rs` + `sqe-coordinator` | Atomic replace. In-place snapshot replace when schema and partitioning match (table keeps UUID, grants, history; properties not re-applied). Staged table + swap otherwise. Self-referencing replace safe (reads old snapshot before swap). | yes | yes | partial | yes |
@@ -51,13 +51,13 @@ A column `DEFAULT` takes a literal and makes the table format-version 3. An `INS
 
 | Statement | Origin | Notes | Trino | Snowflake | Spark SQL | DuckDB |
 |---|---|---|---|---|---|---|
-| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column. Rows written before the ALTER read the default, and a later INSERT or MERGE INSERT that omits the column writes it (V3). | yes | yes | yes | yes |
+| `ALTER TABLE t ADD COLUMN c TYPE [DEFAULT expr]` | `sqlparser-rs` + `sqe-coordinator` | New column, nested types included. Rows written before the ALTER read the default, and a later INSERT or MERGE INSERT that omits the column writes it (V3). | yes | yes | yes | yes |
 | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` | `sqlparser-rs` + `sqe-coordinator` | Logical drop. Field id retained in old data files. | yes | yes | yes | yes |
 | `ALTER TABLE t RENAME COLUMN old TO new` | `sqlparser-rs` + `sqe-coordinator` | Iceberg field id stays the same; only the name changes. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Tighten nullability. Fails if existing rows have NULL. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c DROP NOT NULL` | `sqlparser-rs` + `sqe-coordinator` | Loosen nullability. | yes | yes | yes | yes |
 | `ALTER TABLE t ALTER COLUMN c SET DEFAULT expr` | `sqlparser-rs` + `sqe-coordinator` | Iceberg V3 column default. | partial | yes | yes | yes |
-| `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Type promotion only (e.g. INT -> BIGINT). Lossy changes rejected. | partial | partial | partial | partial |
+| `ALTER TABLE t ALTER COLUMN c TYPE new_type` | `sqlparser-rs` + `sqe-coordinator` | Iceberg type promotion only: INT -> BIGINT, REAL -> DOUBLE, a wider DECIMAL precision with the same scale, and (V3) UNKNOWN -> any primitive type. Any other change is rejected before it is committed. A nested field is named with a dotted path: a struct member as `s.a`, a list element as `l.element`, a map value as `m.value` (`ALTER COLUMN l.element TYPE BIGINT`). A map key cannot change type. | partial | partial | partial | partial |
 | `ALTER TABLE t RENAME TO new_t` | `sqlparser-rs` + `sqe-coordinator` | Catalog rename. Different catalog support varies. | yes | yes | yes | yes |
 | `ALTER TABLE t SET TBLPROPERTIES (...)` | `sqlparser-rs` + `sqe-coordinator` | Set Iceberg properties (e.g. `write.delete.mode`). | yes | yes | yes | - |
 | `COMMENT ON TABLE t IS 'description'` | `sqlparser-rs` + `sqe-coordinator` | Stored in Iceberg properties. | yes | yes | yes | yes |
@@ -71,6 +71,11 @@ ALTER TABLE analytics.events ALTER COLUMN region SET NOT NULL;
 ALTER TABLE analytics.events SET TBLPROPERTIES (
     'write.delete.mode' = 'merge-on-read',
     'write.parquet.bloom-filter-columns' = 'user_id,event_id'
+);
+-- The Iceberg spec form, as Spark writes it, works too:
+ALTER TABLE analytics.events SET TBLPROPERTIES (
+    'write.parquet.bloom-filter-enabled.column.user_id' = 'true',
+    'write.parquet.bloom-filter-fpp.column.user_id' = '0.05'
 );
 ```
 
@@ -91,6 +96,24 @@ ALTER TABLE events REPLACE PARTITION FIELD day(occurred_at) WITH hour(occurred_a
 
 -- Add a bucketing field on top of existing daily partitions.
 ALTER TABLE events ADD PARTITION FIELD bucket(64, user_id);
+```
+
+## Identifier fields (SQE / Iceberg-specific)
+
+Identifier fields are an Iceberg table's row key. With `write.update.mode`, `write.merge.mode` or `write.delete.mode` set to `merge-on-read`, UPDATE, MERGE and DELETE write equality deletes against them. Without identifier fields, UPDATE and MERGE fall back to copy-on-write and DELETE writes position deletes (V2) or deletion vectors (V3). SQE parses these in `sqe-sql/src/identifier_fields.rs`.
+
+| Statement | Notes | Trino | Snowflake | Spark SQL |
+|---|---|---|---|---|
+| `ALTER TABLE t SET IDENTIFIER FIELDS col [, ...]` | Replace the identifier set. Parentheses are optional; `s.x` names a struct member. | - | - | yes |
+| `ALTER TABLE t DROP IDENTIFIER FIELDS col [, ...]` | Remove columns from the set. Each must currently be an identifier field. | - | - | yes |
+
+An identifier column must be `NOT NULL`, a primitive type other than `FLOAT` or `DOUBLE`, and not inside a list, map or nullable struct; SQE refuses anything else. The change commits a new schema, so files already written are not touched.
+
+```sql
+CREATE TABLE orders (id BIGINT NOT NULL, status VARCHAR)
+  WITH ('write.update.mode' = 'merge-on-read');
+ALTER TABLE orders SET IDENTIFIER FIELDS id;
+UPDATE orders SET status = 'shipped' WHERE id = 42;  -- equality delete + one new row
 ```
 
 ## Branches and tags (SQE / Iceberg-specific)
@@ -174,13 +197,14 @@ object and a later implementation, or another engine, can honour it.
 
 ## Iceberg V3 type system
 
-These types only exist in format-version 3, the default for new tables. A `TIMESTAMP_NS` or `VARIANT` column, or a `DEFAULT`, makes the table V3 even when the configured default is 2.
+These types only exist in format-version 3, the default for new tables. A `TIMESTAMP_NS`, `VARIANT`, `GEOMETRY` or `GEOGRAPHY` column, or a `DEFAULT`, makes the table V3 even when the configured default is 2.
 
 | Type | Notes |
 |---|---|
 | `TIMESTAMP_NS`, `TIMESTAMP_NS WITH TIME ZONE` | Nanosecond precision timestamps. Arrow `Timestamp(Nanosecond, ...)`. |
 | `VARIANT` | Semi-structured value (object, array, string, number, boolean, null) in the Iceberg variant binary encoding. See [VARIANT](#variant) below. |
-| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Top-level only; a nested unknown field is refused. |
+| `GEOMETRY[(crs)]`, `GEOGRAPHY[(crs[, algorithm])]` | Spatial values as WKB bytes. See [GEOMETRY and GEOGRAPHY](#geometry-and-geography) below. |
+| `UNKNOWN` (also `VOID`) | A column declared before its type is known. Holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. Also allowed as a struct member, including a struct inside a list; a member is promoted with `ALTER COLUMN s.u SET DATA TYPE`. An unknown list element or map key/value, or a struct whose members are all unknown, can be declared but no row can be written (Iceberg Java refuses the same). |
 | Default values via `DEFAULT expr` | Existing rows in older snapshots inherit the default at read time. |
 
 ### VARIANT
@@ -191,13 +215,31 @@ INSERT INTO events VALUES (1, '{"user": "a", "tags": [1, 2]}'), (2, '"plain text
 ```
 
 - **Writes parse text as JSON.** A string written to a `VARIANT` column is parsed as a JSON document: `'{"a": 1}'` stores an object and `'42'` stores a number. To store a JSON string, quote it: `'"text"'`. Text that is not valid JSON fails the statement; it is never stored as NULL. Other column types (numbers, booleans, structs, lists) are stored as the variant of their value.
-- **Reads return JSON text.** Clients have no variant type. The Trino protocol reports the column as `json` and sends each value as JSON text; Flight SQL / ADBC / JDBC return it as a UTF-8 string. `DESCRIBE` and `information_schema.columns` report `variant`, and `SHOW CREATE TABLE` prints `VARIANT`.
+- **Reads return JSON text.** Clients have no variant type. The Trino protocol reports the column as `json` and sends each value as JSON text; Flight SQL / ADBC / JDBC return it as a UTF-8 string. `DESCRIBE`, `information_schema.columns`, `typeof` and `SHOW CREATE TABLE` report `variant`.
 - **The table becomes format-version 3.** `CREATE TABLE` and CTAS with a variant column create a V3 table. `ALTER TABLE ... ADD COLUMN c VARIANT` is refused on a V2 table. V3 tables can be read by Spark 4.0 with Iceberg 1.10 or later, and by Trino 481 or later; older readers cannot open them.
 - **`JSON` is a variant on a V3 table.** A `JSON` column, also inside a `STRUCT` or `ROW`, is stored as `VARIANT` when the table is format-version 3 and as a string otherwise. New tables are V3 by default (`catalog.default_table_format_version = 3`), so a plain `CREATE TABLE t (doc JSON)` stores a variant. A table is V2 when it asks for it with `WITH ('format-version' = '2')`, the Trino form `WITH (format_version = 2)` or `TBLPROPERTIES ('format-version' = '2')`, or when the configured default is 2; its `JSON` columns are strings, which readers without V3 support (Trino < 481, Spark < 4.0, Iceberg < 1.10) can open. `ALTER TABLE ... ADD COLUMN c JSON` adds a variant to a V3 table and a string to a V2 one. Asking for format-version 1 or 2 on a table with a V3-only column is an error.
 - **JSON functions read a variant.** `json_extract`, `json_extract_scalar`, the `json_get_*` functions and the other `json*` functions take a variant as its JSON text, so the same query works on a V2 `JSON` string and a V3 variant.
+- **`variant_get` reads a typed field.** `variant_get(payload, '$.tags[1]', 'int')` reads one field straight from the variant encoding, without rendering the value as JSON text first. The path is `$` followed by `.field`, `['field']` or `[index]` steps, and must be a literal. The third argument names the result type: `boolean`, `tinyint`, `smallint`, `int`, `bigint`, `float`, `double`, `decimal(p,s)`, `string`, `binary`, `date`, `timestamp`, `timestamp_ntz`. Without it the result is a variant. A path that does not exist gives NULL. A value that does not convert to the type is an error; `try_variant_get` gives NULL instead. Both follow Spark's functions of the same names.
+- **Compaction keeps the values.** `CALL system.rewrite_data_files` on a table with a variant column rewrites it as variant, and every value reads back unchanged.
 - **Existing JSON columns are not converted.** Iceberg does not allow evolving a `string` column to `variant`, so a column that holds JSON text stays a string. To convert one, copy it into a table declared with a `VARIANT` column, where the write parses each value: `CREATE TABLE t2 (id BIGINT, doc VARIANT); INSERT INTO t2 SELECT id, doc FROM t1;`.
-- **Shredded files are read, not written.** A variant another engine wrote shredded (Spark with `write.parquet.shred-variants=true`) reads as the same JSON text as an unshredded one, on the coordinator and on workers. SQE always writes unshredded variants, and it unshreds on read, so a shredded field gives no pruning or typed access.
-- **Not yet:** variant path functions (`variant_get`), writing shredded variants, and nested variants (inside a `ROW` or `ARRAY`) on Flight SQL, which arrive as the raw storage struct.
+- **Shredded variants.** A table with `WITH ('write.parquet.shred-variants' = 'true')` is written shredded, as Spark and Iceberg Java write it: each data file infers its shredding from its first batch. A column whose values are all objects stores every field that has one type in every row (integer, double, string, boolean or date, also inside nested objects; at most 64 fields) in its own Parquet column. A column whose values are all one of those types is stored as that type. Arrays, decimals, timestamps and fields of mixed type stay in the binary value, and a later row whose field has another type is written unshredded, so no value changes type. Only top-level variant columns are shredded. A variant another engine wrote shredded reads as the same JSON text as an unshredded one, on the coordinator and on workers. SQE unshreds on read, so a shredded field gives no pruning or typed access yet.
+- **Not yet:** nested variants (inside a `ROW` or `ARRAY`) on Flight SQL, which arrive as the raw storage struct.
+
+### GEOMETRY and GEOGRAPHY
+
+```sql
+CREATE TABLE places (id BIGINT, shape GEOMETRY(4326), area GEOGRAPHY);
+INSERT INTO places VALUES (1, X'0101000000000000000000F03F0000000000000040', NULL);
+ALTER TABLE places ADD COLUMN footprint GEOMETRY(3857);
+```
+
+- **The CRS.** The argument is an SRID or a quoted CRS string such as `'EPSG:28992'`. SRIDs map as Spark maps them: 4326 is Iceberg's default `OGC:CRS84`, 0 is `SRID:0`, and any other number n is `EPSG:n`. Without an argument the CRS is `OGC:CRS84`.
+- **The geography algorithm.** `GEOGRAPHY` takes the edge interpolation algorithm as a second argument: `spherical` (the default), `vincenty`, `thomas`, `andoyer` or `karney`. Spark's DDL takes no second argument.
+- **Values are WKB.** A write must give well-known binary; anything else fails the statement with the column and row. A read returns the WKB bytes.
+- **The table becomes format-version 3.** `ALTER TABLE ... ADD COLUMN` with a geospatial type is refused on a V2 table. CTAS from a geospatial table keeps the types.
+- **Top-level columns only.** A geospatial type inside a `STRUCT`, `ARRAY` or `MAP` is refused.
+- **Functions.** The `ST_*` functions read and build these values; see [Geospatial](./geospatial.md).
+- **Not yet:** pruning on the bounding box.
 
 ## What CREATE / ALTER does NOT cover
 

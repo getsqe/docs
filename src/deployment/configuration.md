@@ -27,6 +27,10 @@ worker_secret = ""              # Shared secret for worker heartbeat auth (empty
 debug = false                   # When true, error messages include internal details (dev only)
 flight_compression = "lz4"      # IPC compression for client DoGet responses
 shuffle_compression = "zstd"    # IPC compression for internal DoExchange shuffle
+spill_dir = "/tmp/sqe-coordinator-spill"  # Where sorts, aggregates and joins spill
+spill_compression = "lz4"       # Spill file codec: "lz4", "zstd" or "none"
+spill_max_bytes = "100GB"       # Disk cap for spill files; a query that would
+                                # spill past it fails, naming this setting
 session_context_cache_ttl_secs = 60  # Per-user SessionContext cache TTL. Also the
                                 # passive backstop for catalog-set discovery: a
                                 # catalog created/rebound out-of-band appears within
@@ -350,12 +354,16 @@ queue_capacity = 10000          # bounded writer queue; drops increment
 fail_mode = "open"              # open: drop events and keep serving
                                 # closed: QueryHandler refuses new statements
                                 # when the queue is full or the writer is gone
+omit_query_text = false         # true: no SQL text, only query_hash + text_len
+omit_actor_identity = false     # true: no actor email or roles
 
 # Advisory / active auto-compaction (Phase 4a+). Off by default: no
 # maintenance principal is constructed and no scheduler task runs
 # unless mode is set. See "Maintenance (auto-compaction)" below.
 [maintenance]
 mode = "off"                    # "off" (default) | "advisory" | "active"
+orphan_min_age_secs = 86400     # a deleting remove_orphan_files refuses an
+                                # older_than newer than now minus this (one day)
 
 # Required only when mode != "off" (validation rejects mode without this block).
 # [maintenance.principal]
@@ -471,6 +479,8 @@ Every config field can be overridden via environment variable. Convention: `SQE_
 | `SQE_METRICS__AUDIT_LOG_PATH` | `metrics.audit_log_path` | string |
 | `SQE_METRICS__AUDIT__QUEUE_CAPACITY` | `metrics.audit.queue_capacity` | usize |
 | `SQE_METRICS__AUDIT__FAIL_MODE` | `metrics.audit.fail_mode` | string (`open` or `closed`) |
+| `SQE_METRICS__AUDIT__OMIT_QUERY_TEXT` | `metrics.audit.omit_query_text` | bool |
+| `SQE_METRICS__AUDIT__OMIT_ACTOR_IDENTITY` | `metrics.audit.omit_actor_identity` | bool |
 
 Boolean values accept: `true`/`false`, `1`/`0`, `yes`/`no`.
 

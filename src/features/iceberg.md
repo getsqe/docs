@@ -11,7 +11,7 @@ SQE is built on the [iceberg-rust](https://github.com/apache/iceberg-rust) libra
 - **Parquet**: 59
 - **Iceberg table format**: V2 and V3. V3 is the default for new tables. V3 features verified end-to-end: TIMESTAMP_NS, column defaults, equality-delete UPDATE on identifier-fields, partition evolution, deletion vectors, row lineage, `VARIANT`, and top-level unknown columns.
 
-The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 147/162 (90.7%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
+The matrix score against [icebergmatrix.org](https://icebergmatrix.org) is 158/162 (97.5%), rescored in October 2026 against the current rubric, which scores only the cells that apply to each format version. Scores from the older rubric (167/189) are not comparable. See [getsqe.com/compare/iceberg](https://getsqe.com/compare/iceberg) for the per-cell breakdown and the side-by-side V2/V3 comparison against every other engine on the public scoreboard.
 
 ## Architecture
 
@@ -43,7 +43,9 @@ SQE keeps the catalog choice as a runtime configuration concern. Every catalog b
 | Project Nessie 0.107+ | `rest` | Iceberg REST | bearer / anonymous | live verified |
 | AWS Glue (Iceberg REST) | `rest` | Iceberg REST + AWS SigV4 | AWS provider chain | live verified |
 | AWS S3 Tables (REST) | `rest` | Iceberg REST + AWS SigV4 (`s3tables` signing) | AWS provider chain | live verified |
-| Unity Catalog OSS | `rest` | Iceberg REST | bearer (Databricks) / anonymous (OSS) | live verified, read-only on OSS |
+| Databricks Unity Catalog | `rest` | Iceberg REST | Databricks user token, passed through | live verified: read, write and DML both ways ([interop run](#databricks-unity-catalog-interop)) |
+| Snowflake Horizon | `rest` | Iceberg REST | Snowflake access token, passed through | live verified: read, write and DML both ways ([interop run](#snowflake-horizon-interop)) |
+| Unity Catalog OSS | `rest` | Iceberg REST | anonymous | live verified, read-only |
 | AWS Glue (native SDK) | `glue` | aws-sdk-glue | AWS provider chain | live verified eu-example-1 |
 | AWS S3 Tables (native SDK) | `s3tables` | aws-sdk-s3tables | AWS provider chain | live verified eu-example-2 |
 | Hive Metastore | `hms` | Thrift | none / Kerberos | live verified |
@@ -59,6 +61,89 @@ Two SQE-only patches sit on top of the vendored loader. The first feature-gates 
 Live integration tests for HMS, Nessie, JDBC Postgres, AWS Glue, AWS S3 Tables, and Unity OSS live in `sqe-catalog/tests/backends_integration.rs`. Each is `#[ignore]` and runs against a docker-compose overlay or a real cloud account configured via `.env`. Glue and S3 Tables are also live-verified (2026-05-05) against AWS account `123456789012` in eu-example-1 and eu-example-2.
 
 The AWS REST endpoints share the OSS Iceberg REST code path. Phase P added an `aws-sigv4` cargo feature to the vendored `iceberg-catalog-rest` crate that swaps the OAuth/Bearer authenticator for an AWS SigV4 signer when `rest.sigv4-enabled=true` lands in the catalog properties (or in the server's `/v1/config` defaults). The signer reads credentials from the standard AWS provider chain.
+
+## Databricks Unity Catalog interop
+
+Databricks-hosted Unity Catalog serves its managed Iceberg tables over the Iceberg REST protocol at `/api/2.1/unity-catalog/iceberg-rest`. SQE reaches it with the `rest` backend and no service account. The user signs in to Databricks, SQE validates the user's token against the workspace JWKS (a `bearer_token` auth provider), and the same token goes to Unity Catalog, which vends short-lived storage credentials for the tables that user may read.
+
+```toml
+[[auth.providers]]
+type = "bearer_token"
+jwks_url = "https://<region>.cloud.databricks.com/oidc/jwks.json"
+issuer = "https://<workspace host>/oidc"
+audience = "<workspace id>"
+user_claim = "sub"
+
+[catalogs.dbx]
+catalog_url = "https://<workspace host>/api/2.1/unity-catalog/iceberg-rest"
+warehouse = "<Unity catalog name>"
+```
+
+The interop run in `scripts/interop/databricks-uc/` checks both directions against a live workspace. Each engine writes tables, the other reads them, both run DML on the other's tables, and every read runs on both engines with the rows compared value by value. Wrong values fail the run, not only errors.
+
+| Direction | What it covers |
+|---|---|
+| Databricks writes, SQE reads | every scalar type including `TIMESTAMP_NTZ` and `BINARY`, structs, arrays, maps, liquid clustering, schema evolution (add, widen, rename), V3 deletion vectors, `VARIANT`, `GEOMETRY(4326)` |
+| SQE writes, Databricks reads | CREATE, CTAS, INSERT, UPDATE, DELETE, MERGE, ADD COLUMN, a partitioned table, V2 and V3 tables, `VARIANT`, `GEOMETRY` |
+| Databricks DML on SQE tables | DELETE, UPDATE and INSERT, including a deletion vector on an SQE-written V3 table |
+| SQE DML on Databricks tables | DELETE, UPDATE, MERGE and INSERT, on V2 and V3 tables |
+
+All 27 compared reads match in embedded mode (`ATTACH` in `sqe-cli`), against a single coordinator, and against a coordinator with a worker. The distributed run found a real bug: a worker read its data files without the table's delete files, so rows that Databricks had deleted with a deletion vector came back. A scan ticket now carries each data file's position deletes and deletion vector, and the worker skips those rows. A snapshot with equality deletes is still scanned on the coordinator.
+
+Known gaps from the same run:
+
+- The embedded CLI runs CREATE (with `PARTITIONED BY` and table properties), CTAS, INSERT, UPDATE, DELETE and MERGE on an attached Unity catalog. It refuses ALTER, which goes through the coordinator.
+- `DESCRIBE` reports a Databricks `GEOMETRY` column as `varbinary`. The values read as geometry.
+- `SHOW CREATE TABLE` prints Unity's internal table properties (`databricks.*`, `io.unitycatalog.tableId`, the storage paths) and no clustering clause.
+- A Databricks user token lives about an hour. A longer session needs a fresh login, or an `ATTACH` with an [oauth2 secret](../operations/catalogs.md#example-rest-catalog-with-an-oauth2-client-credential) that refreshes a service principal's token. That trades the user's grants for the principal's.
+- A Delta table listed in the same Unity schema is refused with "not an Iceberg table". SQE reads Iceberg only.
+
+## Snowflake Horizon interop
+
+Snowflake serves its Iceberg tables over the Iceberg REST protocol at `/polaris/api/catalog`, with a Snowflake database as the warehouse. SQE reaches it with the `rest` backend and no service account. The user's key pair signs a JWT, Horizon trades it for an access token scoped to one role, and SQE passes that token through. Horizon vends storage credentials only when asked, so the catalog sets `access_delegation`.
+
+```toml
+[[auth.providers]]
+type = "bearer_passthrough"   # the Horizon token is opaque; Horizon validates it
+user = "<label for the audit log>"
+
+[catalogs.sf]
+catalog_url = "https://<orgname>-<accountname>.snowflakecomputing.com/polaris/api/catalog"
+warehouse = "<Snowflake database>"
+access_delegation = "vended-credentials"
+identifier_case = "upper"     # unquoted names fold to upper case, as in Snowflake
+```
+
+`bearer_passthrough` belongs on a test rig. Horizon publishes no JWKS for its access tokens, so SQE cannot validate them itself and leaves that to Horizon. The embedded CLI attaches the same endpoint with `ACCESS_DELEGATION 'vended-credentials'` and `IDENTIFIER_CASE 'upper'` ([example](../operations/catalogs.md#example-snowflake-horizon)).
+
+Snowflake folds unquoted names to upper case and SQE folds them to lower case. With `identifier_case = "upper"`, SQE folds unquoted names for that catalog the Snowflake way, so `SELECT id FROM sf.sales.orders` finds `SALES.ORDERS` and its `ID` column. Without it, quote Snowflake's names: `sf."SALES"."ORDERS"`. The [identifier case](../operations/catalogs.md#identifier-case) section lists what folds and how policies bind.
+
+The interop run in `scripts/interop/snowflake-horizon/` follows the Databricks run: each engine writes, the other reads, both run DML on the other's tables, and 40 reads are compared value by value.
+
+| Direction | What it covers |
+|---|---|
+| Snowflake writes, SQE reads | scalar types including `TIMESTAMP_LTZ`, `TIMESTAMP_NTZ`, nanosecond timestamps, `BINARY` and `TIME`, `OBJECT`, `ARRAY` and `MAP`, identity and month partitions, schema evolution, V3 `VARIANT`, `GEOMETRY(4326)` and `GEOGRAPHY`, position deletes (V2) and deletion vectors (V3) from merge-on-read DML |
+| SQE writes, Snowflake reads | CREATE, CTAS, INSERT, UPDATE, DELETE, MERGE, ALTER, V2 and V3 tables, `VARIANT`, `GEOMETRY`, a deletion vector from a merge-on-read DELETE |
+| Snowflake DML on SQE tables | DELETE, UPDATE and INSERT, including a DELETE over SQE's deletion vector |
+| SQE DML on Snowflake tables | DELETE, UPDATE and MERGE, on V2 and V3 tables |
+
+All 40 reads match in embedded mode, against a single coordinator, and against a coordinator with a worker. The run found five things SQE now handles:
+
+- **Table placement.** Horizon refuses a `CREATE TABLE` that names a location. SQE resends the create without one, and Horizon places the table.
+- **Commit pacing.** A commit that follows the previous one within about half a second is refused, with a 409 that names no failed requirement or a 500 "Indeterminate result". Neither was applied. SQE resends schema commits, backs data commits off at least 500 ms, and retries an unknown outcome only after a reload shows the table did not move.
+- **File layout.** Snowflake writes parquet columns in an order of its own and adds row-lineage columns. A worker matched columns by position and returned values under the wrong names. Every worker scan that reads columns now carries a projection fill, `SELECT *` included, and the worker matches by field id.
+- **Delete files.** Snowflake encodes integer columns with 512-value `DELTA_BINARY_PACKED` miniblocks, and parquet before 59.3.2 could not skip rows inside one. Applying a Snowflake position delete or deletion vector failed with "cannot skip miniblock of size 512". SQE now builds against parquet 59.3.2.
+- **Name case.** Every Snowflake name needed quotes in SQE. A catalog with `identifier_case = "upper"` folds unquoted names the Snowflake way, `USE` targets included.
+
+Known gaps from the same run:
+
+- A table SQE writes with lower-case names needs quotes in Snowflake (`"sqe_orders"`, `"id"`), and in SQE too when the catalog sets `identifier_case = "upper"`. Snowflake has the same cost the other way round.
+- A row filter on a Snowflake column quotes it (`"REGION" = 'EU'`). Policy expressions are not folded, and an unquoted name fails the query.
+- The interop harness runs without `identifier_case` and quotes every Snowflake name, so the option is checked by a separate probe, not by the 40-read compare.
+- Snowflake rewrites small tables copy-on-write whatever the table's merge-on-read setting. Its delete files appear only on large tables with `ICEBERG_MERGE_ON_READ_BEHAVIOR = 'enabled'`; the harness uses 1M rows.
+- `ST_AREA` on an Iceberg `GEOMETRY` comes back negative in Snowflake, whichever engine wrote the table.
+- An external volume encrypted with a customer KMS key fails: the credentials Horizon vends lack `kms:Decrypt`. Use Snowflake-managed storage.
+- A Horizon access token lives about an hour.
 
 ## Catalog REST surface
 
@@ -118,7 +203,7 @@ Read-side optimizations:
 - **Column projection**: only requested columns leave Parquet.
 - **Predicate pushdown**: filters land at the row group level, the page-index level, and the Parquet `RowFilter`.
 - **Runtime filter pushdown**: Phase P shipped a `DynamicPredicate` API that absorbs DataFusion 54 hash-join build-side runtime filters into the same pruning surface. SF10 TPC-H lineitem-heavy queries saw `q06 -51%`, `q07 -31%`, `q14 -33%`. Engineering log at [Runtime filter pushdown](../design-notes/runtime-filter-pushdown.md).
-- **Bloom filter consultation**: `write.parquet.bloom-filter-columns` lands bloom offsets in the file footer; DataFusion consults them automatically for literal equality predicates at scan time.
+- **Bloom filter consultation**: `write.parquet.bloom-filter-columns` or the Iceberg spec key `write.parquet.bloom-filter-enabled.column.<col>` lands bloom offsets in the file footer; DataFusion consults them automatically for literal equality predicates at scan time.
 - **5-layer caching**: REST catalog cache, table metadata cache, manifest cache, SessionContext cache, OAuth token cache. Warm queries hit sub-millisecond planning.
 
 ## Write path
@@ -136,13 +221,18 @@ Supported DML, both V2 and V3 verified:
 - **CREATE TABLE AS SELECT**: Apache Iceberg V2 and V3, including TIMESTAMP_NS columns and DEFAULT literals.
 - **INSERT INTO**: streaming, with proper schema validation against the catalog.
 - **DELETE FROM**: Copy-on-Write via `RewriteFilesAction`, or Merge-on-Read via `PositionDeleteFileWriter` when `write.delete.mode=merge-on-read`.
-- **UPDATE**: CoW or MoR (equality deletes when the table declares an identifier-field-id).
+- **UPDATE**: CoW or MoR (equality deletes when the table has identifier fields; declare them with `ALTER TABLE t SET IDENTIFIER FIELDS id`).
 - **MERGE INTO**: full WHEN MATCHED / WHEN NOT MATCHED semantics, dispatching to CoW or MoR based on the table's `write.merge.mode` (default copy-on-write).
 - **ALTER TABLE**: `ADD/DROP/RENAME COLUMN`, `SET/DROP NOT NULL`, type promotion, `ADD/DROP/REPLACE PARTITION FIELD` (partition evolution), `CREATE/DROP BRANCH/TAG`, `SET WRITE BRANCH`.
 
 DELETE reads `write.delete.mode`, UPDATE reads `write.update.mode`, and MERGE reads `write.merge.mode`. Each defaults to copy-on-write. CTAS and INSERT stream RecordBatches straight to Parquet at constant memory. Partitioned writes use a bounded fanout writer by default. It caps the number of open per-partition writers and the buffered bytes, both derived from the memory pool unless `fanout_max_open_writers` or `fanout_buffer_budget` is set, and flushes the least-recently-written writer when a limit is hit.
 
-The writer respects `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp` for any column the schema knows about. The footer-inspection test in `sqe-catalog/src/parquet_writer_config.rs` proves bloom offsets land in the resulting Parquet file.
+The writer respects `write.parquet.bloom-filter-columns` and `write.parquet.bloom-filter-fpp` for any column the schema knows about. It also reads the Iceberg spec keys that Spark and other Iceberg writers set:
+
+- `write.parquet.bloom-filter-enabled.column.<col>` = `true` adds the column, `false` removes it even when the SQE list or `_sk` auto-detection picked it.
+- `write.parquet.bloom-filter-fpp.column.<col>` sets the false-positive probability for that column. On its own it does not enable a bloom.
+
+`<col>` is the full Iceberg name, so `s.x` for a struct member. Members of lists and maps get no bloom. `write.parquet.bloom-filter-max-bytes` is ignored: the Parquet writer sizes a filter from the row count. The footer-inspection test in `sqe-compaction/src/parquet_writer_config.rs` proves bloom offsets land in the resulting Parquet file, and `bloom_spec_spark_interop` checks the footer of an SQE INSERT into a table Spark configured.
 
 ## Maintenance procedures
 
@@ -158,11 +248,12 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 ## V3 features verified
 
 - **TIMESTAMP_NS / TIMESTAMPTZ_NS**: V3 nanosecond timestamps round-trip end-to-end.
-- **Variant**: `VARIANT` columns store unshredded variant values written from JSON text, survive CTAS and INSERT ... SELECT, and read back as JSON text ([details](../sql-reference/ddl.md#variant)). On a V3 table a `JSON` column is a variant too, and the `json*` functions read it. Shredded files written by other engines read the same as unshredded ones; SQE writes unshredded variants and has no variant path functions yet.
+- **Variant**: `VARIANT` columns store unshredded variant values written from JSON text, survive CTAS and INSERT ... SELECT, and read back as JSON text ([details](../sql-reference/ddl.md#variant)). On a V3 table a `JSON` column is a variant too, and the `json*` functions read it. `variant_get` / `try_variant_get` read a typed field without going through JSON text, and `rewrite_data_files` keeps every value. Shredded files written by other engines read the same as unshredded ones, and SQE writes shredded variants when the table sets `write.parquet.shred-variants`.
 - **Column defaults**: `CREATE TABLE ... DEFAULT <literal>` applies `write_default`; `ALTER TABLE ADD COLUMN ... DEFAULT` applies `initial_default`.
 - **Deletion vectors (V3)**: MoR DELETE on a V3 table writes one deletion vector per data file, never a position-delete file. A second DELETE on the same file merges its existing deletes into a new vector and retires the old one in the same commit, so a data file never carries two. The engine refuses any commit that would add a position-delete file to a V3 table.
 - **Row lineage (V3)**: new rows get a fresh `_row_id` at commit. CoW DELETE / UPDATE / MERGE, MoR UPDATE / MERGE and `rewrite_data_files` carry `_row_id` and `_last_updated_sequence_number` into the files they write.
-- **Unknown columns (V3)**: a top-level `UNKNOWN` or `VOID` column holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. A Spark-written `VOID` column reads as NULLs. Nested unknown fields are refused.
+- **Unknown columns (V3)**: a top-level `UNKNOWN` or `VOID` column holds only NULLs, is never written to data files, and is promoted later with `ALTER COLUMN ... SET DATA TYPE`. A Spark-written `VOID` column reads as NULLs. An unknown struct member (`STRUCT<a INT, u VOID>`, also inside a list) works the same way in both directions, and is promoted with `ALTER COLUMN s.u SET DATA TYPE`. An unknown list element or map key/value, or a struct whose members are all unknown, can be declared and read but not written: Parquet has no column for them, and Iceberg Java refuses the same writes.
+- **Geometry / geography (V3)**: SQE reads `GEOMETRY` and `GEOGRAPHY` columns written by another engine as WKB bytes (Arrow `LargeBinary` tagged `geoarrow.wkb`), so they can be selected, compared, joined on and passed to a client that decodes WKB. `CREATE TABLE`, `ALTER TABLE ADD COLUMN` and CTAS create such columns ([details](../sql-reference/ddl.md#geometry-and-geography)). INSERT, UPDATE and `rewrite_data_files` write into such a table. A value must be valid WKB; anything else fails the write. Each data file carries a geometry column's bounding box as its manifest bounds. A geography column gets none, since Parquet computes no box for it. Verified both ways against Spark 4.1 with Iceberg 1.12. The planar `ST_*` functions ([Geospatial](../sql-reference/geospatial.md)) work on a `GEOMETRY` column, and their geometry results write back into one. A predicate on a geospatial column is never pushed into the scan, so there is no bounding-box pruning yet.
 - **Equality deletes (V3)**: UPDATE with a declared identifier-field-id commits a single RowDelta with new data file plus equality-delete row.
 - **Partition evolution (V3)**: `ALTER TABLE ADD/DROP/REPLACE PARTITION FIELD` evolves the spec on V3 tables, including with day(ts) on TIMESTAMP_NS columns.
 - **Time travel (V3)**: `FOR SYSTEM_TIME AS OF` and `FOR VERSION AS OF` work against V3 tables through the same snapshot walk as V2.
@@ -170,8 +261,7 @@ SQE runs table maintenance through `CALL system.*` procedures, each committing t
 
 V3 features not available yet:
 
-- **Geometry / geography**: no iceberg-rust support, and pending DataFusion UDT [#12644](https://github.com/apache/datafusion/issues/12644).
+- **Geospatial pruning and spherical math**: an `ST_*` filter does not prune files on their bounding boxes, and there are no spherical `GEOGRAPHY` functions.
 - **Multi-arg partition transforms**: `PARTITIONED BY` accepts single-source transforms only.
-- **Variant path functions**: no `variant_get` yet.
 
 The deferred list is tracked in `docs/evidence/iceberg-matrix-state.json` under `caveats` for each cell.
