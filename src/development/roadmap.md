@@ -203,7 +203,7 @@ SF10 numbers, the clean-rig methodology, and the per-shape guidance on when dist
 | Iceberg REST (Polaris, Lakeformation) | Done - default |
 | Databricks Unity Catalog (Iceberg REST, user token passthrough) | Done - read, write and DML both ways, live-verified 2026-10-27 |
 | Unity Catalog OSS (REST-compatible) | Done - read-only upstream |
-| Snowflake Horizon (REST-compatible) | Done |
+| Snowflake Horizon (Iceberg REST, user token passthrough) | Done - read, write and DML both ways, live-verified 2026-11-05; `identifier_case = "upper"` folds unquoted names the Snowflake way |
 | AWS Glue | Done |
 | AWS S3 Tables | Done |
 | Nessie | Done |
@@ -255,7 +255,7 @@ Not yet wired:
 
 ## Phase 7 - Iceberg V3 (Done)
 
-Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 156/162 (96.3%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
+Iceberg V3 table format support landed end-to-end. V3 is the default format-version for new tables. The vendored fork at `vendor/iceberg-rust/` carries V3 spec coverage. SQE Iceberg matrix score: 158/162 (97.5%) on the current rubric, rescored in October 2026 (per `docs/evidence/iceberg-matrix-state.json`). The older 167/189 score used a different rubric and is not comparable.
 
 ### V3 Features Shipped
 
@@ -305,7 +305,7 @@ Iceberg V3 table format support landed end-to-end. V3 is the default format-vers
 - Runtime `ATTACH` / `CREATE SECRET` against any of the supported catalog backends
 - `UPDATE`, `DELETE` and `MERGE INTO` on the warehouse and on attached Iceberg catalogs, through the coordinator's write handlers (copy-on-write or merge-on-read per table)
 - `CREATE TABLE` on the warehouse and on attached Iceberg catalogs, through the coordinator's DDL handler: `PARTITIONED BY` transforms, `TBLPROPERTIES` / `WITH` options, nested columns, format version 3 by default
-- Iceberg metadata tables (`"t$snapshots"`, `$history`, `$manifests`, `$files`, `$partitions`, `$refs`) on the warehouse and on attached Iceberg catalogs, read from the catalog the table name is qualified with
+- Iceberg metadata tables (`"t$snapshots"`, `$history`, `$manifests`, `$files`, `$partitions`, `$refs`) on the warehouse and on attached Iceberg catalogs, read from the catalog the table name is qualified with; `$files` lists delete files and deletion vectors with Iceberg's `content` column, as Spark and Trino do
 - `ALTER TABLE` on the warehouse and on attached Iceberg catalogs, through the coordinator's DDL handler: column add, drop, rename and type change (nested fields included), `SET TBLPROPERTIES`, partition evolution, identifier fields, branches and tags, `RENAME TO`
 - `SHOW CREATE TABLE` on Iceberg tables, rendered by the same code as on a coordinator: columns, `PARTITIONED BY`, sort order and `TBLPROPERTIES`, and the printed DDL creates the table again
 - Time travel (`FOR VERSION AS OF <snapshot id | 'branch' | 'tag'>`, `FOR TIMESTAMP AS OF`, `FOR SYSTEM_TIME AS OF`) on the warehouse and on attached Iceberg catalogs, resolved by the same code as the coordinator
